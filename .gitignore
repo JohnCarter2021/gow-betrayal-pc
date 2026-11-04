@@ -1,0 +1,7 @@
+/target
+extracted/
+*.jar
+*.png
+*.zip
+game-frame*.png
+test-frame.png
