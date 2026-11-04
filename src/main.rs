@@ -14,6 +14,8 @@
 //! Build with the cargo in ~/.cargo/bin (not on the default PATH here):
 //!   ~/.cargo/bin/cargo run --release -- ../extracted --render-test ../test-frame.png
 
+#[cfg(feature = "window")]
+mod play_window;
 mod anim;
 mod crc;
 mod enemies;
@@ -153,6 +155,22 @@ fn main() {
              Run: unzip -o <jar> -d extracted && cargo run --release -- extracted"
         );
         std::process::exit(2);
+    }
+    if args.get(2).map(|s| s.as_str()) == Some("--play-window") {
+        // --play-window [factor] [save-dir]
+        // Live OS window + keyboard (slice 4a part 2). Requires the
+        // window feature: cargo run --release --features window.
+        let factor: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3);
+        let save_dir = args.get(4).map(|s| s.as_str());
+        #[cfg(feature = "window")]
+        {
+            std::process::exit(play_window::run(&target, factor, save_dir));
+        }
+        #[cfg(not(feature = "window"))]
+        {
+            eprintln!("--play-window needs the window feature: rebuild with --features window");
+            std::process::exit(2);
+        }
     }
     if args.get(2).map(|s| s.as_str()) == Some("--entities") {
         // --entities <level-id> [out-prefix]

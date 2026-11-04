@@ -188,9 +188,20 @@ down, down, Select, Select, and draws the result to
   keys, one frame per tick, scaled PNG + timing).
   Verified: 278 frames in 11,181 ms (40.2 ms/frame,
   max drift 0 ms), sharp 720x960 frame.
-  NOT yet: a real OS window (winit) + live keyboard —
-  cannot be verified on this headless VM, so it is a
-  separate chunk, not faked here.
+- Slice 4a part 2 DONE (2026-11-04): real OS window in
+  `play_window.rs` — winit window + live keyboard,
+  softbuffer software presentation (no GPU needed),
+  40 ms frame loop via ControlFlow::WaitUntil, same
+  240x320 framebuffer integer-scaled (default 3x).
+  Controls: arrows move / hold to walk, Enter or Space
+  = Select, Space in gameplay = Attack, Escape = Back.
+  Feature-gated (`--features window`) so the default
+  build stays std-only and `cargo test` needs no
+  display. Run: `gow-betrayal-pc <extracted-dir>
+  --play-window [factor] [save-dir]`.
+  Compile-verified on Linux and Windows (MinGW);
+  the window itself can only be run on a machine
+  with a display, so it awaits the user's PC test.
 - Slice 4b DONE (2026-11-04): file-backed save in
   `save.rs` — the original's 76-byte `z(1)`/`A(1)`
   format (18 big-endian i32, store "2", hm = ho*192+1024,

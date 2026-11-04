@@ -477,6 +477,24 @@ impl Game {
         }
     }
 
+    /// Live-window frame step for Playing: advance one 40 ms
+    /// gameplay frame with the current held_dir (set by the window
+    /// loop from held arrow keys). Scripted modes keep using
+    /// update(), which ticks per key press; this exists so holding
+    /// an arrow walks continuously in the real window.
+    pub fn tick_playing(&mut self) {
+        if self.state == State::Playing {
+            self.gameplay_tick();
+        }
+    }
+
+    /// Same, for a frame where the player attacked (Space pressed).
+    pub fn tick_playing_attack(&mut self) {
+        if self.state == State::Playing {
+            self.gameplay_tick_attack();
+        }
+    }
+
     pub fn tick(&mut self, delta_ms: i32) {
         let l = delta_ms;
         // Camera movement towards target.

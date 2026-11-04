@@ -2,9 +2,9 @@
 
 A Rust PC port, in progress, of *God of War: Betrayal* (J2ME, Glu Mobile, v1.4.8).
 
-Status, 2026-11-04 — v0.2.0: slices 1–2 (menus), slice 3 (gameplay),
+Status, 2026-11-04 — v0.3.0: slices 1–2 (menus), slice 3 (gameplay),
 wiring, window layer (timing/scaling), file-backed save, all levels +
-Arena, Help/About, and MIDI audio state:
+Arena, Help/About, MIDI audio state, and a playable OS window:
 
 - **MIDP shim, std-only, no crates:** 240×320 framebuffer, `Graphics`
   (clip / translate / `drawRegion` with all 8 MIDP transforms), sprite
@@ -38,11 +38,19 @@ Arena, Help/About, and MIDI audio state:
 - **Audio, slice 7:** the 11 RP1 MIDI chunks are standard MIDI
   (format 1, division 960); iM slots 0 = 1063 (music), 1 = 1064,
   2 = 1062; audio prompt and Sound toggle drive playback state.
+- **Playable window, slice 4a part 2:** a real OS window (winit)
+  with live keyboard and software rendering (softbuffer, no GPU),
+  40 ms frames, integer-scaled to 720×960 by default. Arrows move
+  (hold to walk), Enter/Space = Select, Space in gameplay = Attack,
+  Escape = Back. Feature-gated: build with `--features window`;
+  the default build stays std-only.
 
-Verified locally: `cargo test --release` 35/35. A Windows exe was
-cross-compiled on Linux (x86_64-pc-windows-gnu, MinGW target);
-it has **not** been run on Windows yet — the user's PC is the
-final test environment.
+Verified locally: `cargo test --release` 35/35. The v0.2.0 Windows
+exe was verified on a real Windows PC (all modes match Linux).
+The v0.3.0 Windows exe is cross-compiled on Linux
+(x86_64-pc-windows-gnu, MinGW target) with the window feature;
+the window itself has **not** been run yet — this VM is headless,
+so the user's PC is the final test environment for it.
 
 ## No game assets are included
 
@@ -58,11 +66,15 @@ at its extracted RP files (see `rust-port-README.md`).
 ```sh
 cargo build --release
 cargo test --release
+# With the playable window (winit + softbuffer):
+cargo build --release --features window
 ```
 
 ## Modes
 
 ```sh
+# Playable window (needs the --features window build)
+./gow-betrayal-pc <extracted-dir> --play-window
 # Menus, scripted keys: up,down,left,right,select,exit,attack,tick
 ./gow-betrayal-pc <extracted-dir> --game out select,select,select
 # Real-time window-layer mode (40 ms frames, 3x scaled PNG)
@@ -75,8 +87,9 @@ cargo test --release
 
 ## Honest limits
 
-- Real OS window + live keyboard (winit) is not yet implemented;
-  `--window` is a real-time scripted runner, not a GUI.
+- The playable window has not been run on a real display yet
+  (this VM is headless); `--window` remains the scripted
+  real-time runner for headless checks.
 - Actual MIDI sound output needs a synth on the target (Windows winmm).
 - Death/stagger animations, hitbox rectangles (`ht[]`), Arena
   waves/scoring, level-complete flow, and 3GP video are not yet ported.

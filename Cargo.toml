@@ -1,8 +1,8 @@
 [package]
 name = "gow-betrayal-pc"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "Rust PC port of God of War: Betrayal (J2ME) — MIDP shim, menus, gameplay, combat, HUD, save, all levels, Help/About, MIDI audio state"
+description = "Rust PC port of God of War: Betrayal (J2ME) — MIDP shim, menus, gameplay, combat, HUD, save, all levels, Help/About, MIDI audio state, playable window (winit, optional)"
 license = "MIT"
 
 [[bin]]
@@ -11,3 +11,12 @@ path = "src/main.rs"
 
 [profile.release]
 opt-level = 3
+
+# Optional: the live window (slice 4a part 2). Kept optional so the
+# default build stays std-only and cargo test never needs a display.
+[dependencies]
+winit = { version = "0.30", optional = true }
+softbuffer = { version = "0.4", optional = true }
+
+[features]
+window = ["winit", "softbuffer"]
