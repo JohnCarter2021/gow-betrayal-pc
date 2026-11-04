@@ -68,6 +68,7 @@ pub enum Input {
     Right,
     Select,
     Exit,
+    Attack,
 }
 
 impl Input {
@@ -80,6 +81,7 @@ impl Input {
             Input::Right => 5,
             Input::Select => 27,
             Input::Exit => 29,
+            Input::Attack => 8,
         }
     }
 }
@@ -92,6 +94,8 @@ pub enum State {
     MainMenu,
     Playing,
     Exited,
+    /// State 107: Help (ai=false) / About (ai=true) dialog.
+    HelpAbout,
 }
 
 #[derive(Debug, Clone)]
@@ -100,27 +104,7 @@ pub struct DialogLine {
     pub flag: u8,
 }
 
-#[derive(Debug, Clone)]
-pub struct Save {
-    pub g_n: i32,
-    pub g_o: i32,
-    pub palette_index: i32,
-    pub hm: i32,
-    pub hn: i32,
-}
-
-impl Default for Save {
-    fn default() -> Self {
-        // e.A(1) defaults when RecordStore "2" is absent.
-        Save {
-            g_n: 3,
-            g_o: 2,
-            palette_index: 0,
-            hm: 1024,
-            hn: 1024,
-        }
-    }
-}
+pub use crate::save::SaveData as Save;
 
 pub struct Game {
     pub res: Resources,
@@ -128,7 +112,9 @@ pub struct Game {
     pub lang_index: usize,
     pub strings: Vec<String>,
     pub save: Save,
+    pub save_dir: Option<std::path::PathBuf>,
     pub audio_enabled: Option<bool>,
+    pub audio: crate::audio::Audio,
     pub exited: bool,
     // Boot / menu assets (n() steps 0, 1, 3).
     pub font: Option<Font>,
@@ -159,6 +145,11 @@ pub struct Game {
     pub playing_level: Option<i32>, // bA: level id for state 1
     pub playing_arena: bool,  // iN: arena mode
     pub help_or_about: Option<&'static str>,
+    pub help_about_text: String,
+    pub help_about_scroll: i32,
+    pub pending_help_about: bool,
+    pub gameplay: Option<crate::gameplay::Gameplay>,
+    pub held_dir: i32,
 }
 
 impl Game {
@@ -169,7 +160,9 @@ impl Game {
             lang_index: 0,
             strings: Vec::new(),
             save: Save::default(),
+            save_dir: None,
             audio_enabled: None,
+            audio: crate::audio::Audio::default(),
             exited: false,
             font: None,
             font_height: 0,
@@ -195,6 +188,11 @@ impl Game {
             playing_level: None,
             playing_arena: false,
             help_or_about: None,
+            help_about_text: String::new(),
+            help_about_scroll: 0,
+            pending_help_about: false,
+            gameplay: None,
+            held_dir: 0,
         }
     }
 
@@ -256,17 +254,17 @@ impl Game {
                 self.font_menu = Some(Font::from_sprite_set(o_set));
                 let p_set = self.res.sprite_set(1033, None)?;
                 self.font_title = Some(Font::from_sprite_set(p_set));
+                // Case 0 tail: A(1) save load (defaults if absent),
+                // then menu setup uses the loaded progress.
+                // Save comes from RecordStore "2" in save_dir
+                // when set, else defaults.
+                self.load_save();
                 let menu_chunk = self.res.chunk(1028)?;
                 let mut menu = Menu::from_chunk(&menu_chunk);
-                menu.apply_progress(self.save.palette_index as usize);
-                self.menu_progress = self.save.palette_index as usize;
-                self.menu_level = self.save.palette_index;
+                menu.apply_progress(self.save.progress as usize);
+                self.menu_progress = self.save.progress as usize;
+                self.menu_level = 0;
                 self.menu = Some(menu);
-                // Case 0 tail: A(1) save load (defaults if absent), then
-                // state 78. Save loading itself is slice 1's Save::default
-                // unless a RecordStore "2" file exists — the file-backed
-                // store is in midp::RecordStore; wire it when the window
-                // layer supplies a save directory (slice 3).
                 self.state = State::LanguageSelect;
                 return Ok(true);
             }
@@ -331,10 +329,13 @@ impl Game {
             State::AudioPrompt => match input {
                 Input::Select => {
                     self.audio_enabled = Some(true);
+                    self.audio.set_enabled(true);
+                    self.audio.play(0); // y(0): menu music
                     self.start_audio_transition();
                 }
                 Input::Exit => {
                     self.audio_enabled = Some(false);
+                    self.audio.set_enabled(false);
                     self.start_audio_transition();
                 }
                 _ => {}
@@ -346,6 +347,51 @@ impl Game {
                     return;
                 }
                 self.menu_input(input);
+            }
+            State::HelpAbout => {
+                // State 107 dialog: Up/Down scroll, Exit (Back)
+                // returns to MainMenu (camera back to origin).
+                match input {
+                    Input::Up => {
+                        if self.help_about_scroll > 0 {
+                            self.help_about_scroll -= 12;
+                        }
+                    }
+                    Input::Down => {
+                        self.help_about_scroll += 12;
+                    }
+                    Input::Exit => {
+                        self.state = State::MainMenu;
+                        self.help_about_scroll = 0;
+                        self.set_camera_target(0, 0);
+                    }
+                    _ => {}
+                }
+            }
+            State::Playing => {
+                // Gameplay keys: Left/Right set the held direction and
+                // advance one frame, Attack swings and advances one frame,
+                // Exit returns to the main menu (softkey Menu, not yet
+                // a pause screen in the original either - it opens the
+                // in-game menu, state 102, which is not ported yet).
+                match input {
+                    Input::Left => {
+                        self.held_dir = -1;
+                        self.gameplay_tick();
+                    }
+                    Input::Right => {
+                        self.held_dir = 1;
+                        self.gameplay_tick();
+                    }
+                    Input::Attack => {
+                        self.gameplay_tick_attack();
+                    }
+                    Input::Exit => {
+                        self.state = State::MainMenu;
+                        self.gameplay = None;
+                    }
+                    _ => {}
+                }
             }
             _ => {}
         }
@@ -368,6 +414,69 @@ impl Game {
     /// One frame step: camera movement (e.a() tail, speed 35, L = delta
     /// ms) and the m() transition for state 79. Call this before
     /// update() for the frame's input, or with None, in the window loop.
+    pub fn set_save_dir(&mut self, dir: impl AsRef<std::path::Path>) {
+        self.save_dir = Some(dir.as_ref().to_path_buf());
+    }
+
+    /// Load RecordStore "2" into self.save, or defaults if absent.
+    pub fn load_save(&mut self) {
+        if let Some(dir) = &self.save_dir {
+            let rs = crate::midp::RecordStore::new(dir);
+            if let Some(bytes) = rs.read_all("2") {
+                if let Some(save) = crate::save::SaveData::from_bytes(&bytes) {
+                    self.save = save;
+                    return;
+                }
+            }
+        }
+        self.save = Save::default();
+    }
+
+    /// Write self.save to RecordStore "2" (z(1)). No-op without
+    /// a save directory. Sets `saved` on success.
+    pub fn persist_save(&mut self) {
+        if let Some(dir) = &self.save_dir {
+            let rs = crate::midp::RecordStore::new(dir);
+            if rs.write_all("2", Some(&self.save.to_bytes())) {
+                self.saved = true;
+            }
+        } else {
+            self.saved = true;
+        }
+    }
+
+    /// Delete RecordStore "2" (Clear Save).
+    pub fn clear_save_file(&mut self) {
+        if let Some(dir) = &self.save_dir {
+            let rs = crate::midp::RecordStore::new(dir);
+            rs.write_all("2", None);
+        }
+        self.save = Save::default();
+    }
+
+    /// Load gameplay for the level just entered (menu -> state 1).
+    /// Failure keeps the placeholder draw (gameplay stays None).
+    pub fn enter_playing(&mut self) {
+        if let Some(level_id) = self.playing_level {
+            let arena = self.playing_arena;
+            self.gameplay = crate::gameplay::Gameplay::load(&mut self.res, level_id as u32, arena).ok();
+        }
+    }
+
+    fn gameplay_tick(&mut self) {
+        if let Some(gp) = &mut self.gameplay {
+            let dir = self.held_dir;
+            gp.tick(&mut self.res, dir, false);
+        }
+    }
+
+    fn gameplay_tick_attack(&mut self) {
+        if let Some(gp) = &mut self.gameplay {
+            let dir = self.held_dir;
+            gp.tick(&mut self.res, dir, true);
+        }
+    }
+
     pub fn tick(&mut self, delta_ms: i32) {
         let l = delta_ms;
         // Camera movement towards target.
@@ -395,6 +504,26 @@ impl Game {
                 self.cam_y = self.cam_target_y;
             }
         }
+        if self.cam_x == self.cam_target_x && self.cam_y == self.cam_target_y {
+            self.cam_moving = false;
+        }
+        // Help/About: camera arrived at (160,160) with a pending
+        // Help/About selection -> state 107 dialog (ai flag).
+        if self.pending_help_about
+            && self.state == State::MainMenu
+            && self.cam_x == self.cam_target_x
+            && self.cam_y == self.cam_target_y
+            && self.cam_target_x == (160 << 8)
+        {
+            self.pending_help_about = false;
+            self.help_about_text = if self.help_or_about == Some("about") {
+                self.string(115).replace('%', "1.4.8")
+            } else {
+                format!("{}\n{}", self.string(114), self.string(292))
+            };
+            self.help_about_scroll = 0;
+            self.state = State::HelpAbout;
+        }
         // m() countdown, then the state-79 transition.
         if self.cam_x == self.cam_target_x
             && self.cam_y == self.cam_target_y
@@ -414,7 +543,7 @@ impl Game {
         {
             // m() for I == 79: a(0,0,35,35), save, state 80.
             self.set_camera_target(0, 0);
-            self.saved = true;
+            self.persist_save();
             self.state = State::MainMenu;
             self.audio_transition_started = false;
         }
@@ -446,7 +575,8 @@ impl Game {
                             // Play Game with no progress: start level 9217.
                             self.playing_level = Some(9217);
                             self.playing_arena = false;
-                            self.state = State::Playing;
+                            self.enter_playing();
+self.state = State::Playing;
                         } else if next != menu.ix {
                             // Gameroom items link to themselves (external
                             // lobby links, not implemented in slice 2);
@@ -459,13 +589,19 @@ impl Game {
                         // Sound toggle (iM.a(!iM.b())).
                         let enabled = self.audio_enabled.unwrap_or(true);
                         self.audio_enabled = Some(!enabled);
+                        self.audio.set_enabled(!enabled);
+                        if !enabled {
+                            self.audio.play(0);
+                        }
                     }
                     3 => {
                         self.help_or_about = Some("help");
+                        self.pending_help_about = true;
                         self.set_camera_target(160, 160);
                     }
                     4 => {
                         self.help_or_about = Some("about");
+                        self.pending_help_about = true;
                         self.set_camera_target(160, 160);
                     }
                     5 => {
@@ -476,24 +612,26 @@ impl Game {
                         self.menu_level = b_c;
                         self.playing_level = Some(level_ids.get(b_c as usize).copied().unwrap_or(9217));
                         self.playing_arena = false;
-                        self.state = State::Playing;
+                        self.enter_playing();
+self.state = State::Playing;
                     }
                     6 => {
                         // Arena: bA = 9216, iN = true.
                         self.playing_level = Some(9216);
                         self.playing_arena = true;
-                        self.state = State::Playing;
+                        self.enter_playing();
+self.state = State::Playing;
                     }
                     8 => {
                         // Exit: M() — save then destroy.
-                        self.saved = true;
+                        self.persist_save();
                         self.state = State::Exited;
                         self.exited = true;
                     }
                     11 => {
                         // Clear Save confirm: clear RecordStore "2",
                         // reload defaults, go to next menu (19).
-                        self.save = Save::default();
+                        self.clear_save_file();
                         self.menu_level = 0;
                         self.menu_progress = 0;
                         if let Some(menu) = &mut self.menu {
@@ -529,7 +667,7 @@ impl Game {
     /// starting at y = 5*z, stepping z + z/4, arrows bo[2]/bo[3] flanking
     /// the selected row. Audio prompt draws the same banners plus the
     /// dialog lines (centred, starting at y=30, stepping z).
-    pub fn draw(&self, fb: &mut Framebuffer) {
+    pub fn draw(&mut self, fb: &mut Framebuffer) {
         fb.clear(0xFF00_0000);
         let mut g = Graphics::default();
         g.set_clip_full(240, 320);
@@ -537,13 +675,17 @@ impl Game {
             return;
         };
         let z = self.font_height;
-        if let Some(banners) = &self.banners {
+        // State 107 (Help/About) draws only the dialog text, no
+        // menu banners — the original's case 107 does not draw r[].
+        if self.state != State::HelpAbout {
+            if let Some(banners) = &self.banners {
             if let Some(f) = banners.frame(0) {
                 draw_sprite_frame(&g, fb, &banners.image, f, 120, 0, 0);
             }
             if let Some(f) = banners.frame(1) {
                 draw_sprite_frame(&g, fb, &banners.image, f, 120, 0, 0);
             }
+        }
         }
         match self.state {
             State::LanguageSelect => {
@@ -661,18 +803,95 @@ impl Game {
                 font.draw(&g, fb, self.string(0), 60, 306, 1);
                 font.draw(&g, fb, self.string(1), 180, 306, 1);
             }
+            State::HelpAbout => {
+                // State 107: black screen, dialog text (font q,
+                // height 12), scrolled by help_about_scroll.
+                // Wrapping: split on \n, then wrap long lines at
+                // the 240 px screen width using font widths.
+                let mut lines: Vec<String> = Vec::new();
+                for para in self.help_about_text.split('\n') {
+                    if para.is_empty() {
+                        lines.push(String::new());
+                        continue;
+                    }
+                    let mut cur = String::new();
+                    for word in para.split(' ') {
+                        let trial = if cur.is_empty() {
+                            word.to_string()
+                        } else {
+                            format!("{cur} {word}")
+                        };
+                        if font.width(&trial) > 236 && !cur.is_empty() {
+                            lines.push(cur);
+                            cur = word.to_string();
+                        } else {
+                            cur = trial;
+                        }
+                    }
+                    lines.push(cur);
+                }
+                let mut y = -self.help_about_scroll;
+                for line in &lines {
+                    if y >= -12 && y < 320 {
+                        font.draw(&g, fb, line, 2, y, 4);
+                    }
+                    y += 12;
+                }
+                // Bottom bar softkeys: Back (string 2) on the right.
+                font.draw(&g, fb, self.string(2), 180, 306, 1);
+            }
+            State::HelpAbout => {
+                // State 107: black screen, dialog text (font q,
+                // height 12), scrolled by help_about_scroll.
+                let mut lines: Vec<String> = Vec::new();
+                for para in self.help_about_text.split('\n') {
+                    if para.is_empty() {
+                        lines.push(String::new());
+                        continue;
+                    }
+                    let mut cur = String::new();
+                    for word in para.split(' ') {
+                        let trial = if cur.is_empty() {
+                            word.to_string()
+                        } else {
+                            format!("{cur} {word}")
+                        };
+                        if font.width(&trial) > 236 && !cur.is_empty() {
+                            lines.push(cur);
+                            cur = word.to_string();
+                        } else {
+                            cur = trial;
+                        }
+                    }
+                    lines.push(cur);
+                }
+                let mut y = -self.help_about_scroll;
+                for line in &lines {
+                    if y >= -12 && y < 320 {
+                        font.draw(&g, fb, line, 2, y, 4);
+                    }
+                    y += 12;
+                }
+                font.draw(&g, fb, self.string(2), 180, 306, 1);
+            }
             State::Playing => {
-                // Slice-2 placeholder: gameplay (state 1) is slice 3.
-                // Show the level id and name so the menu -> game handoff
-                // is visible and testable.
-                let level_name = match self.playing_level {
-                    Some(9216) => "Arena".to_string(),
-                    Some(9217) => self.string(54).to_string(),
-                    Some(id) => format!("level {id}"),
-                    None => String::new(),
-                };
-                font.draw(&g, fb, &level_name, 120, 140, 1);
-                font.draw(&g, fb, "gameplay: slice 3", 120, 160, 1);
+                if let Some(gp) = &self.gameplay {
+                    // Gameplay draws its own HUD; font is the slice-1
+                    // bitmap font (def 1031) already loaded by boot.
+                    if let Some(font) = &self.font {
+                        gp.draw(fb, &mut self.res, font);
+                    }
+                } else {
+                    // Fallback placeholder if gameplay failed to load.
+                    let level_name = match self.playing_level {
+                        Some(9216) => "Arena".to_string(),
+                        Some(9217) => self.string(54).to_string(),
+                        Some(id) => format!("level {id}"),
+                        None => String::new(),
+                    };
+                    font.draw(&g, fb, &level_name, 120, 140, 1);
+                    font.draw(&g, fb, "gameplay: slice 3", 120, 160, 1);
+                }
             }
             _ => {}
         }
@@ -867,5 +1086,87 @@ mod tests {
         // Exit returns to Options (ix 3).
         game.update(Some(Input::Exit));
         assert_eq!(game.menu.as_ref().unwrap().ix, 3);
+    }
+}
+
+#[cfg(test)]
+mod help_about_tests {
+    #[test]
+    fn help_and_about_enter_state_107() {
+        // Help: Right,Right from Play Game, then Select.
+        let mut g = super::Game::new("../extracted");
+        g.boot().unwrap();
+        g.update(Some(super::Input::Select)); // language -> audio
+        g.update(Some(super::Input::Select)); // audio yes -> menu (settle)
+        for _ in 0..200 {
+            if g.state == super::State::MainMenu && !g.cam_moving && g.cam_x == 0 && g.cam_y == 0 {
+                break;
+            }
+            g.tick(40);
+        }
+        g.update(Some(super::Input::Right));
+        g.update(Some(super::Input::Right));
+        g.update(Some(super::Input::Select));
+        for _ in 0..200 {
+            if g.state == super::State::HelpAbout {
+                break;
+            }
+            g.tick(40);
+        }
+        assert_eq!(g.state, super::State::HelpAbout);
+        assert!(g.help_about_text.starts_with("Combat"));
+        assert!(g.help_about_text.contains("Support@spe.sony.com"));
+        // Back to menu.
+        g.update(Some(super::Input::Exit));
+        assert_eq!(g.state, super::State::MainMenu);
+    }
+
+    #[test]
+    fn about_text_has_version() {
+        let mut g = super::Game::new("../extracted");
+        g.boot().unwrap();
+        g.update(Some(super::Input::Select));
+        g.update(Some(super::Input::Select));
+        for _ in 0..200 {
+            if g.state == super::State::MainMenu && !g.cam_moving && g.cam_x == 0 && g.cam_y == 0 {
+                break;
+            }
+            g.tick(40);
+        }
+        for _ in 0..4 {
+            g.update(Some(super::Input::Right));
+        }
+        g.update(Some(super::Input::Select));
+        for _ in 0..200 {
+            if g.state == super::State::HelpAbout {
+                break;
+            }
+            g.tick(40);
+        }
+        assert_eq!(g.state, super::State::HelpAbout);
+        assert!(g.help_about_text.starts_with("Version 1.4.8"));
+    }
+}
+
+#[cfg(test)]
+mod audio_tests {
+    #[test]
+    fn audio_prompt_yes_enables_and_plays_slot_0() {
+        let mut g = super::Game::new("../extracted");
+        g.boot().unwrap();
+        g.update(Some(super::Input::Select)); // language -> audio prompt
+        assert_eq!(g.state, super::State::AudioPrompt);
+        g.update(Some(super::Input::Select)); // yes
+        assert_eq!(g.audio_enabled, Some(true));
+        assert!(g.audio.enabled);
+        assert_eq!(g.audio.current_slot, Some(0));
+        // No: disable
+        let mut g2 = super::Game::new("../extracted");
+        g2.boot().unwrap();
+        g2.update(Some(super::Input::Select));
+        g2.update(Some(super::Input::Exit));
+        assert_eq!(g2.audio_enabled, Some(false));
+        assert!(!g2.audio.enabled);
+        assert_eq!(g2.audio.current_slot, None);
     }
 }

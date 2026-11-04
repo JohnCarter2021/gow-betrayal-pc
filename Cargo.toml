@@ -1,8 +1,8 @@
 [package]
 name = "gow-betrayal-pc"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "PC port scaffold for God of War: Betrayal (J2ME, Glu Mobile) — RP pack parser + MIDP shim skeleton, Rust"
+description = "Rust PC port of God of War: Betrayal (J2ME) — MIDP shim, menus, gameplay, combat, HUD, save, all levels, Help/About, MIDI audio state"
 license = "MIT"
 
 [[bin]]

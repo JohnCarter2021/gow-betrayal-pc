@@ -87,9 +87,152 @@ down, down, Select, Select, and draws the result to
   language, bottom bar "Sélect" / "Quitt." — both are the pack's
   literal French strings, verified, not rendering bugs).
 
+## Step 4, slice 3a — level tile map (2026-11-04)
+- `src/level.rs`: `e.a(byte[], false)` case 0 up to the tile map,
+  with the `e.m(int)` bit reader (low bits of each byte first, as
+  in `e.m`). Palette + map + collision bits, tileset 2058
+  (128x256, 16x16 tiles, 8 per row); drawn tile = palette[map cell]
+  (the `1 + nArray` in `b.a` minus the `-1` in `b.b`).
+- Verified: For Sparta 9217 = 232x39 tiles (3712x624 px), palette
+  107, q=122, hs=1250; 19456 = 204x46, 20480 = 112x59.
+  `cargo run --release -- ../extracted --level 9217 1600 200 <prefix>`
+  renders a mid-level viewport (buildings, roofs, windows) that
+  matches the tile data; camera 0,0 is correctly mostly sky with
+  ground at row 19. `cargo test --release`: 14/14.
+- Slice 3b-1 DONE (2026-11-04): `src/entities.rs` + `--entities`
+  mode parses all entity groups after the tile map (u=10 branch,
+  `d()` extra reads per type, positions cumulative with `bz` bits).
+  For Sparta: 27 groups, 1032 entities, bits 102815/102816 (1
+  padding bit — the whole chunk is consumed, so no read pattern
+  is wrong). Player spawn type 26 at (48, 560); type 23 static
+  placements 653; enemies type 11 x8, type 13 x1. Extra values are
+  stored flattened in read order, semantics not yet named.
+- Slice 3b-2 DONE (2026-11-04): start camera + group names in
+  `src/entities.rs` (`start_camera`, `kind_name`). Spawn type 26
+  (48, 560), facing right, so iQ = 48-120-60 = -132 -> clamped 0,
+  iR = 560-266 = 294; first frame camera (0, 294). Named from
+  `d()` usage: 26 player spawn, 11/12/13 enemies, 23 static
+  sprites, 3 camera zones, 6 action tables, tile-flag markers,
+  sprite objects. Type 4 and a few others stay unnamed — parsed,
+  not yet proven. `cargo test --release`: 16/16.
+- Slice 3b-3 DONE (2026-11-04): `src/anim.rs` + `--scene` mode.
+  `a.g(3073)` loader (k/l variable ints, B/D/F/G/H/J tables,
+  exact stream end at 6270 bytes) + frame extraction, then
+  `e.s()` layer order (0..7) for type-23 placements with sprite
+  set 3076 (224 frames, max sprite index 223 — matches).
+  Start-camera scene shows bushes, pots and doorway detail that
+  tiles alone lacked. `cargo test --release`: 17/17.
+- Slice 3c-1 DONE (2026-11-04): player sprite on `--scene`.
+  Slot 135, anim set 28672 action 0 (idle, from `s(0)` in `t()`),
+  sprite set 28673 (279 frames, action 0 = 20 frames), at spawn
+  (48, 560), transform facing_right ? 0 : 2. `frames_for_action`
+  gained a transform-XOR variant, because `b(Graphics)` uses raw
+  dx/dy + final transform while `a(short[])` pre-flips dx/dy —
+  both now reproduce `c.a` exactly. `cargo test --release`: 18/18.
+- Slice 3c-2 DONE (2026-11-04): walk + camera follow, in
+  `player.rs` + `--play` mode. `AnimSlot::advance` ports
+  `a.b(int, int)` (root motion from the D table, visual frame
+  from C>>6, repeat 63); walk action 9 = 6 px per 70 ms frame.
+  `TileFlags` builds `iW` from the level header bits + type 22
+  crosses + type 31 singles (flag 1 only; other flag-1 sources
+  like sprite footprints are not yet included). Walk checks
+  use (gb-1)/16, not gb/16 — the latter tests the solid ground
+  row itself and blocks every step (found by debugging a
+  walk that did not move). Camera ports `e.o()` (target
+  ga-120+60, L=40, cap 40 px/tick, clamped). 40 ticks right:
+  ga 48 -> 183, camera 0 -> 104. `cargo test`: 19/19.
+- Slice 3d-1 DONE (2026-11-04): enemy spawn, in `enemies.rs`.
+  Type 11/12/13 groups, extra layout, sprite/anim sets by
+  level flags (9217: dA true -> 18432/18433; type-13 special
+  pair -> 13312/13313, health 25). 9 enemies for 9217, drawn
+  on `--scene`/`--play` after static sprites, before the
+  player, as in `r(Graphics)`. `cargo test`: 20/20.
+- Slice 3d-2 DONE (2026-11-04): enemy movement, in
+  `enemies.rs` `EnemyState`. Chase (type-1 AI): within
+  144/32 px of the player, face him and walk (action 1,
+  root motion ~4-5 px/100 ms frame); within 48/16 px stop
+  (attack is 3d-3). Patrol fallback for `ev` enemies at
+  spawn +/- 64 px. All 9217 enemies have ev=0, so they
+  idle until the player approaches — verified: after 80
+  ticks right, enemy at 336 walked to 297 and stopped in
+  attack range, enemy at 448 walked to 439. `cargo test`:
+  21/21.
+- Slice 3d-3 DONE (2026-11-04): combat, in `player.rs` /
+  `enemies.rs` + `--play` `attack` key. Player swing action
+  54 (320 ms, hit once at frame >= 2, range 32 px in front,
+  damage 2 = fI[0]<<gP). Enemy attack action 5 (damage
+  el<<1) / 6 (el<<2, every 4th), hit at frame >= 2.
+  Player health 1024 (hj/hm). Verified: enemy at 336
+  (health 3) took 2+2 and died, player took 6 damage
+  (1018/1024). Dead enemies are not drawn (death
+  animation not yet ported). `cargo test`: 22/22.
+- Slice 3e DONE (2026-11-04): HUD, in `hud.rs` + `--play`.
+  Top-left portrait (anim 1025 action 4, sprite 1036),
+  weapon icon frame 5, health/magic bars (width value*6>>8,
+  colours as in `f(Graphics)`), gold text, bottom bar
+  (black 306-320, "Weapon"/"Menu" softkeys, "N Hits"
+  centre when combo > 1, 2000 ms combo timer).
+  Verified on the combat run: "2 Hits" shown, health
+  1018/1024. `cargo test`: 23/23.
+- Wiring DONE (2026-11-04): `--game` state 1 now runs the
+  slice-3 engine via `gameplay.rs` (load/tick/draw shared
+  with `--play`). Menu Play Game -> Playing loads level
+  9217; keys left/right walk, attack swings, tick
+  advances, exit returns to menu. Verified: `--game`
+  select,select,select + walk keys renders Kratos in
+  level with HUD. `cargo test`: 24/24.
+- Slice 4a part 1 DONE (2026-11-04): window layer in
+  `window.rs` — FrameTimer (40 ms frames, drift report,
+  resync on overrun), integer nearest-neighbour scaling
+  (3x = 720x960), `--window` real-time mode (scripted
+  keys, one frame per tick, scaled PNG + timing).
+  Verified: 278 frames in 11,181 ms (40.2 ms/frame,
+  max drift 0 ms), sharp 720x960 frame.
+  NOT yet: a real OS window (winit) + live keyboard —
+  cannot be verified on this headless VM, so it is a
+  separate chunk, not faked here.
+- Slice 4b DONE (2026-11-04): file-backed save in
+  `save.rs` — the original's 76-byte `z(1)`/`A(1)`
+  format (18 big-endian i32, store "2", hm = ho*192+1024,
+  gN>=3/gO>=2 clamps), via the file-backed RecordStore.
+  Save points: audio -> MainMenu, menu Exit, Clear Save
+  deletes the store. `--game`/`--window` take a save-dir
+  argument. Verified: 76-byte file [0,0,3,2,0...], a
+  progress=3/hq=42 save survived a `--game` run intact.
+  Also fixed a latent bug this exposed: save was loaded
+  AFTER the menu was built, so progress never applied
+  on boot. `cargo test`: 29/29.
+- Slice 5 DONE (2026-11-04): all levels + Arena in
+  `gameplay.rs` — LEVEL_IDS (bB), BG palette-key table,
+  tileset key 2068+bG[i] / sprite key 3084+bG[i] when
+  bG[i]>=0, `--levels` mode renders every level's
+  start-camera frame. All 11 load: 10 levels (41x138 to
+  232x39 tiles, 12-15 enemies each) + Arena 9216
+  (86x38, 15 enemies). `cargo test`: 31/31.
+- Slice 6 DONE (2026-11-04): Help/About in `--game`
+  (state 107). Menu type 3 -> Help (string 114 +
+  support email 292), type 4 -> About (string 115
+  with % -> 1.4.8), via camera (160,160) then dialog
+  screen; Up/Down scroll, Exit (Back) returns to menu.
+  Also fixed: `--game` settle loop broke before the
+  camera moved, and menu banners leaked over the
+  dialog. `cargo test`: 33/33.
+- Slice 7 DONE (2026-11-04): audio in `audio.rs` +
+  `--audio` mode. The 11 RP1 flag-0 chunks are standard
+  MIDI (format 1, division 960, track counts match);
+  extracted as .mid files. iM slots: 0 = 1063 (music,
+  6,274 bytes), 1 = 1064, 2 = 1062; `y(n)` only plays
+  slots 0-2. Game wires audio prompt (yes -> enable +
+  play slot 0, no -> disable) and menu Sound toggle.
+  Actual MIDI sound needs a synth on the target
+  (Windows winmm) — state is tracked, sound is NOT
+  faked. `cargo test`: 35/35.
+- Still open: v0.2 (push + tag + Windows zip with
+  MSVC audit, when asked).
+
 ## Next steps (see ../REPORT.md)
-1. Slice 3: gameplay state 1 — level loading (`a.g`, RP level packs),
-   tile renderer (`b.java`), player/enemy update.
+1. Slice 3b: entity/object data after the tile map, spawn, then
+   player/enemy update in state 1.
 2. Window layer (keyboard input, integer scaling, frame timing) on top
    of the framebuffer — not yet built; the shim is backend-free by design.
 3. MIDI/3GP media (`d.java`) — not yet ported.
