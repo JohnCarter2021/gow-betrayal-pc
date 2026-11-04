@@ -18,6 +18,7 @@
 mod play_window;
 mod anim;
 mod crc;
+mod midi;
 mod enemies;
 mod entities;
 mod font;
@@ -318,7 +319,10 @@ fn main() {
                         let out = format!("{prefix}-{id}.mid");
                         fs::write(&out, &chunk).expect("write midi");
                         let slot = audio::SLOTS.iter().find(|(_, rid, _)| *rid == id).map(|(s, _, _)| *s);
-                        println!("midi {id}: format {fmt}, tracks {ntrk}, division {div}, {len} bytes, slot {slot:?}, wrote {out}", len = chunk.len());
+                        let parsed = midi::parse_song(&chunk)
+                            .map(|s| format!("{} events, {} ms", s.events.len(), s.duration_ms))
+                            .unwrap_or_else(|e| format!("parse FAILED: {e}"));
+                        println!("midi {id}: format {fmt}, tracks {ntrk}, division {div}, {len} bytes, slot {slot:?}, {parsed}, wrote {out}", len = chunk.len());
                     }
                     Err(e) => println!("midi {id}: INVALID: {e}"),
                 },

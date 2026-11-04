@@ -2,9 +2,9 @@
 
 A Rust PC port, in progress, of *God of War: Betrayal* (J2ME, Glu Mobile, v1.4.8).
 
-Status, 2026-11-04 — v0.3.0: slices 1–2 (menus), slice 3 (gameplay),
+Status, 2026-11-04 — v0.4.0: slices 1–2 (menus), slice 3 (gameplay),
 wiring, window layer (timing/scaling), file-backed save, all levels +
-Arena, Help/About, MIDI audio state, and a playable OS window:
+Arena, Help/About, MIDI audio playback, and a playable OS window:
 
 - **MIDP shim, std-only, no crates:** 240×320 framebuffer, `Graphics`
   (clip / translate / `drawRegion` with all 8 MIDP transforms), sprite
@@ -35,9 +35,13 @@ Arena, Help/About, MIDI audio state, and a playable OS window:
 - **Help/About, slice 6:** state 107 dialog — Help (string 114 +
   support email 292), About (string 115, version 1.4.8) — with
   scrolling and Back to menu.
-- **Audio, slice 7:** the 11 RP1 MIDI chunks are standard MIDI
+- **Audio, slices 7–8:** the 11 RP1 MIDI chunks are standard MIDI
   (format 1, division 960); iM slots 0 = 1063 (music), 1 = 1064,
   2 = 1062; audio prompt and Sound toggle drive playback state.
+  Slice 8 adds real playback on Windows (winmm MIDI mapper):
+  a full MIDI parser (VLQ deltas, running status, tempo map,
+  track merge) and a background player thread; music loops,
+  the other slots play once. Music 1063: 2,422 events, 33 s.
 - **Playable window, slice 4a part 2:** a real OS window (winit)
   with live keyboard and software rendering (softbuffer, no GPU),
   40 ms frames, integer-scaled to 720×960 by default. Arrows move
@@ -45,12 +49,13 @@ Arena, Help/About, MIDI audio state, and a playable OS window:
   Escape = Back. Feature-gated: build with `--features window`;
   the default build stays std-only.
 
-Verified locally: `cargo test --release` 35/35. The v0.2.0 Windows
+Verified locally: `cargo test --release` 38/38. The v0.2.0 Windows
 exe was verified on a real Windows PC (all modes match Linux).
-The v0.3.0 Windows exe is cross-compiled on Linux
+The v0.4.0 Windows exe is cross-compiled on Linux
 (x86_64-pc-windows-gnu, MinGW target) with the window feature;
-the window itself has **not** been run yet — this VM is headless,
-so the user's PC is the final test environment for it.
+the window and the MIDI sound themselves have **not** been run
+yet — this VM is headless and has no MIDI synth, so the user's
+PC is the final test environment for both.
 
 ## No game assets are included
 
@@ -87,9 +92,9 @@ cargo build --release --features window
 
 ## Honest limits
 
-- The playable window has not been run on a real display yet
-  (this VM is headless); `--window` remains the scripted
-  real-time runner for headless checks.
-- Actual MIDI sound output needs a synth on the target (Windows winmm).
+- The playable window and the MIDI sound have not been run on
+  a real display/synth yet (this VM is headless and has no
+  MIDI synth); `--window` remains the scripted real-time
+  runner for headless checks.
 - Death/stagger animations, hitbox rectangles (`ht[]`), Arena
   waves/scoring, level-complete flow, and 3GP video are not yet ported.

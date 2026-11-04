@@ -238,6 +238,17 @@ down, down, Select, Select, and draws the result to
   Actual MIDI sound needs a synth on the target
   (Windows winmm) — state is tracked, sound is NOT
   faked. `cargo test`: 35/35.
+- Slice 8 DONE (2026-11-04): real MIDI sound in
+  `midi.rs` — full parser (VLQ deltas, running status,
+  tempo map, track merge by tick) + a Windows winmm
+  player (MIDI mapper, background thread, 5 ms stop
+  slices, slot 0 loops, slots 1/2 play once). Game
+  wires it at the audio prompt (yes) and the Sound
+  toggle; disabling stops playback. Non-Windows
+  builds keep the exact same state tracking with an
+  inert player. Music 1063: 2,422 events, 33,020 ms
+  per loop. Sound itself awaits the user's PC (this
+  VM has no MIDI synth). `cargo test`: 38/38.
 - Still open: v0.2 (push + tag + Windows zip with
   MSVC audit, when asked).
 

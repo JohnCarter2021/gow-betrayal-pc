@@ -330,7 +330,7 @@ impl Game {
                 Input::Select => {
                     self.audio_enabled = Some(true);
                     self.audio.set_enabled(true);
-                    self.audio.play(0); // y(0): menu music
+                    self.start_menu_music(); // y(0): menu music
                     self.start_audio_transition();
                 }
                 Input::Exit => {
@@ -394,6 +394,18 @@ impl Game {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// y(0): start the menu music, slot 0 = resource 1063,
+    /// looping. State-only `play(0)` first, so a missing or
+    /// unparsable chunk still leaves the slot state correct;
+    /// `play_midi` then replaces it with real playback on
+    /// Windows (inert elsewhere).
+    fn start_menu_music(&mut self) {
+        self.audio.play(0);
+        if let Ok(bytes) = self.res.chunk(crate::audio::SLOTS[0].1) {
+            let _ = self.audio.play_midi(0, &bytes, true);
         }
     }
 
@@ -609,7 +621,7 @@ self.state = State::Playing;
                         self.audio_enabled = Some(!enabled);
                         self.audio.set_enabled(!enabled);
                         if !enabled {
-                            self.audio.play(0);
+                            self.start_menu_music();
                         }
                     }
                     3 => {

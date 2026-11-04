@@ -16,12 +16,12 @@
 //! early. The other 8 MIDI chunks are not loaded by
 //! `n()` case 4 — their use (if any) is not yet traced.
 //!
-//! Playback: this port is std-only and has no MIDI synth,
-//! so `Audio` tracks enabled/current-slot state exactly
-//! (the part the game logic depends on) and reports what
-//! would play. Actual sound on the target needs a MIDI
-//! synth (on Windows, winmm) — a separate chunk, not
-//! faked here with a silent "player".
+//! Playback (slice 8): `Audio` still tracks enabled /
+//! current-slot state exactly (the part the game logic
+//! depends on), and on Windows it additionally plays the
+//! slot's MIDI bytes through winmm (see midi.rs). On
+//! other targets the player is inert and state is all
+//! there is — same code, same tests, no silent fake.
 
 /// (slot, resource id, RP1 chunk index)
 pub const SLOTS: [(usize, u32, usize); 3] = [
@@ -63,10 +63,12 @@ pub fn validate_midi(bytes: &[u8]) -> Result<(u16, u16, u16), String> {
     Ok((format, ntrk, division))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// No Clone/Copy: the player owns a background thread.
+/// (Nothing outside audio.rs clones an Audio.)
 pub struct Audio {
     pub enabled: bool,
     pub current_slot: Option<usize>,
+    player: Option<crate::midi::MidiPlayer>,
 }
 
 impl Default for Audio {
@@ -74,21 +76,31 @@ impl Default for Audio {
         Audio {
             enabled: false,
             current_slot: None,
+            player: None,
         }
     }
 }
 
 impl Audio {
+    fn stop_player(&mut self) {
+        if let Some(mut p) = self.player.take() {
+            p.stop();
+        }
+    }
+
     /// `iM.a(boolean)`: enable/disable the player.
+    /// Disabling stops any playing song.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if !enabled {
+            self.stop_player();
             self.current_slot = None;
         }
     }
 
     /// `e.y(n)`: play slot n, only for n in {0, 1, 2} and
-    /// only when enabled. Returns true if a slot started.
+    /// only when enabled. State only — no sound. Returns
+    /// true if a slot started.
     pub fn play(&mut self, slot: usize) -> bool {
         if !self.enabled || slot > 2 {
             return false;
@@ -97,8 +109,28 @@ impl Audio {
         true
     }
 
+    /// Same as `play`, but with the slot's MIDI bytes: on
+    /// Windows the song actually plays (slot 0 loops, the
+    /// others play once); elsewhere this is state only.
+    /// A parse failure leaves the previous state untouched
+    /// and returns false.
+    pub fn play_midi(&mut self, slot: usize, bytes: &[u8], looped: bool) -> bool {
+        if !self.enabled || slot > 2 {
+            return false;
+        }
+        let song = match crate::midi::parse_song(bytes) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        self.stop_player();
+        self.player = Some(crate::midi::MidiPlayer::start(song, looped));
+        self.current_slot = Some(slot);
+        true
+    }
+
     /// `iM.c()`: stop the current player.
     pub fn stop(&mut self) {
+        self.stop_player();
         self.current_slot = None;
     }
 }
