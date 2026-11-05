@@ -101,6 +101,11 @@ pub enum State {
     /// next level (with save); Exit goes to the
     /// main menu.
     LevelComplete,
+    /// State 108: death screen (Phase 7).
+    /// Attack/Select respawns at the checkpoint
+    /// (levels only — a no-op in the Arena);
+    /// Exit goes to the main menu.
+    Dead,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +159,11 @@ pub struct Game {
     /// the kills scored in the finished level.
     pub pending_next_level: Option<usize>,
     pub pending_kills: i32,
+    /// True when the death screen shows a new Arena
+    /// record (Phase 7): the kills beat the saved
+    /// best `hz` at the moment of death. Captured
+    /// before `handle_death` updates `save.hz`.
+    pub dead_new_record: bool,
     pub help_or_about: Option<&'static str>,
     pub help_about_text: String,
     pub help_about_scroll: i32,
@@ -204,6 +214,7 @@ impl Game {
             playing_arena: false,
             pending_next_level: None,
             pending_kills: 0,
+            dead_new_record: false,
             help_or_about: None,
             help_about_text: String::new(),
             help_about_scroll: 0,
@@ -399,6 +410,40 @@ impl Game {
                     }
                     Input::Exit => {
                         self.pending_next_level = None;
+                        self.gameplay = None;
+                        self.state = State::MainMenu;
+                        if let Some(menu) = &mut self.menu {
+                            menu.apply_progress(self.menu_progress);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            State::Dead => {
+                // State 108 death screen (Phase 7,
+                // e.java:1257-1280): Attack/Select
+                // respawns at the checkpoint in a level
+                // (a no-op in the Arena); Exit goes to
+                // the main menu. The port skips the
+                // screen-transition animation (`a(H,H,
+                // 35,35)`), as LevelComplete does.
+                match input {
+                    Input::Select | Input::Attack => {
+                        let arena = self
+                            .gameplay
+                            .as_ref()
+                            .map(|gp| gp.arena)
+                            .unwrap_or(false);
+                        if !arena {
+                            if let Some(gp) = &mut self.gameplay {
+                                gp.respawn_at_checkpoint();
+                            }
+                            self.state = State::Playing;
+                        }
+                    }
+                    Input::Exit => {
+                        self.sync_save_from_gameplay();
+                        self.persist_save();
                         self.gameplay = None;
                         self.state = State::MainMenu;
                         if let Some(menu) = &mut self.menu {
@@ -645,6 +690,7 @@ impl Game {
                 }
             }
             MenuOutcome::MainMenu => {
+                self.sync_save_from_gameplay();
                 self.persist_save();
                 self.gameplay = None;
                 self.state = State::MainMenu;
@@ -653,6 +699,7 @@ impl Game {
                 }
             }
             MenuOutcome::QuitApp => {
+                self.sync_save_from_gameplay();
                 self.persist_save();
                 self.exited = true;
                 self.state = State::Exited;
@@ -700,6 +747,11 @@ impl Game {
             // hn = hp*192+1024.
             if let Some(gp) = &mut self.gameplay {
                 gp.set_strings(self.strings.clone());
+                // Already-collected upgrades (Phase 7,
+                // the `he` bitmask): items whose bit is
+                // set start collected, so they cannot
+                // be granted twice.
+                gp.mark_collected_upgrades(self.save.he);
                 gp.player.combo_max = self.save.g_n;
                 gp.player.combo_shift = self.save.g_p;
                 gp.player.combo_max_artemis = self.save.g_o;
@@ -747,6 +799,7 @@ impl Game {
             if self.save.progress < next_idx as i32 {
                 self.save.progress = next_idx as i32;
             }
+            self.sync_save_from_gameplay();
             self.persist_save();
             self.menu_progress = self.save.progress as usize;
             self.playing_level = Some(crate::gameplay::LEVEL_IDS[next_idx] as i32);
@@ -757,6 +810,7 @@ impl Game {
             if self.save.progress < 10 {
                 self.save.progress = 10;
             }
+            self.sync_save_from_gameplay();
             self.persist_save();
             self.menu_progress = self.save.progress as usize;
             self.gameplay = None;
@@ -767,6 +821,53 @@ impl Game {
         }
     }
 
+    /// Copy the run's progress into the save
+    /// (Phase 7): upgrade levels (ho/hp),
+    /// collected-upgrade bits (he, consumed from
+    /// `pending_he_health`), and gold (hs). The
+    /// port previously never synced these — an
+    /// upgrade collected in a level was lost on the
+    /// next persist. Called before every
+    /// `persist_save` that follows gameplay.
+    fn sync_save_from_gameplay(&mut self) {
+        let Some(gp) = &mut self.gameplay else {
+            return;
+        };
+        self.save.ho = gp.health_level;
+        self.save.hp = gp.magic_level;
+        self.save.hs = gp.gold;
+        if let Some(health) = gp.pending_he_health.take() {
+            let bit = 1 << gp.level_index;
+            if health {
+                self.save.he |= bit;
+            } else {
+                self.save.he |= bit << 10;
+            }
+        }
+    }
+
+    /// Consume a death flag from gameplay (Phase 7,
+    /// state 108): when the action-52 animation
+    /// has finished, update the Arena best (hz =
+    /// max(hz, kills), e.java:7548), sync the run's
+    /// progress into the save, persist, and show
+    /// the death screen.
+    fn handle_death(&mut self) {
+        let Some(gp) = &self.gameplay else {
+            return;
+        };
+        if !gp.death_finished {
+            return;
+        }
+        self.dead_new_record = gp.arena && gp.kills > self.save.hz;
+        if gp.arena && gp.kills > self.save.hz {
+            self.save.hz = gp.kills;
+        }
+        self.sync_save_from_gameplay();
+        self.persist_save();
+        self.state = State::Dead;
+    }
+
     fn gameplay_tick(&mut self) {
         if let Some(gp) = &mut self.gameplay {
             let dir = self.held_dir;
@@ -774,6 +875,7 @@ impl Game {
             gp.tick(&mut self.res, dir, false);
         }
         self.handle_level_complete();
+        self.handle_death();
     }
 
     fn gameplay_tick_attack(&mut self) {
@@ -783,6 +885,7 @@ impl Game {
             gp.tick(&mut self.res, dir, true);
         }
         self.handle_level_complete();
+        self.handle_death();
     }
 
     /// Live-window jump frame: start the jump, then advance
@@ -1269,6 +1372,29 @@ self.state = State::Playing;
                     font.draw(&g, fb, "Exit: main menu", 120, 220, 1);
                 }
             }
+            State::Dead => {
+                // State 108 death screen (Phase 7,
+                // e.java:2131-2144): "You Are Dead"
+                // centred; in the Arena the kills
+                // count and the record below it — a
+                // new record when the kills beat the
+                // saved best, else "Record: <best>".
+                if let Some(font) = &self.font {
+                    font.draw(&g, fb, "You Are Dead", 120, 140, 1);
+                    if let Some(gp) = &self.gameplay {
+                        if gp.arena {
+                            let kills = format!("Number of Kills: {}", gp.kills);
+                            font.draw(&g, fb, &kills, 120, 170, 1);
+                            if self.dead_new_record {
+                                font.draw(&g, fb, "New Record!", 120, 200, 1);
+                            } else {
+                                let record = format!("Record: {}", self.save.hz);
+                                font.draw(&g, fb, &record, 120, 200, 1);
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         let _ = &g;
@@ -1574,6 +1700,151 @@ mod help_about_tests {
         assert_eq!(game.playing_level, Some(19456));
     }
 
+    /// Phase 7 (state 108): killing the player
+    /// shows the death screen after action 52
+    /// ends, and Select respawns at the checkpoint
+    /// (the spawn, since no flag-1024 tile was
+    /// crossed) with health refilled.
+    #[test]
+    fn death_screen_respawns_at_checkpoint() {
+        let mut game = Game::new("../extracted");
+        game.boot().unwrap();
+        game.state = State::Playing;
+        game.playing_level = Some(9217);
+        game.playing_arena = false;
+        game.enter_playing();
+        assert!(game.gameplay.is_some());
+        // Dismiss the level intro, then teleport
+        // away from the spawn script tile.
+        game.update(Some(Input::Select));
+        {
+            let gp = game.gameplay.as_mut().unwrap();
+            gp.player.ga = 100 * 16;
+            gp.player.gb = 35 * 16;
+            gp.player.health = 0;
+        }
+        let mut dead = false;
+        for _ in 0..150 {
+            game.gameplay_tick();
+            if game.state == State::Dead {
+                dead = true;
+                break;
+            }
+        }
+        assert!(dead, "death screen shows after action 52 ends");
+        game.update(Some(Input::Select));
+        assert_eq!(game.state, State::Playing, "Select respawns in a level");
+        let gp = game.gameplay.as_ref().unwrap();
+        assert_eq!((gp.player.ga, gp.player.gb), (48, 560), "respawned at the checkpoint");
+        assert_eq!(gp.player.health, gp.player.max_health, "health refilled");
+        assert_eq!(gp.player.action, 0, "player idles after respawn");
+        assert!(!gp.death_finished, "death flag cleared on respawn");
+    }
+
+    /// Phase 7 (state 108, Arena): Attack/Select do
+    /// nothing on the death screen, and the Arena
+    /// best `hz` updates to the kills when they
+    /// beat it. Exit goes to the main menu.
+    #[test]
+    fn arena_death_select_is_noop_and_best_updates() {
+        let mut game = Game::new("../extracted");
+        game.boot().unwrap();
+        game.state = State::Playing;
+        game.playing_level = Some(9216);
+        game.playing_arena = true;
+        game.enter_playing();
+        assert!(game.gameplay.as_ref().unwrap().arena);
+        game.save.hz = 3;
+        {
+            let gp = game.gameplay.as_mut().unwrap();
+            gp.kills = 5;
+            gp.player.health = 0;
+        }
+        let mut dead = false;
+        for _ in 0..150 {
+            game.gameplay_tick();
+            if game.state == State::Dead {
+                dead = true;
+                break;
+            }
+        }
+        assert!(dead, "Arena death screen shows");
+        assert_eq!(game.save.hz, 5, "best updates to the kills");
+        assert!(game.dead_new_record, "5 beats the old best of 3");
+        game.update(Some(Input::Select));
+        assert_eq!(game.state, State::Dead, "Arena death screen ignores Select");
+        game.update(Some(Input::Attack));
+        assert_eq!(game.state, State::Dead, "Arena death screen ignores Attack");
+        game.update(Some(Input::Exit));
+        assert_eq!(game.state, State::MainMenu, "Exit goes to the main menu");
+        assert!(game.gameplay.is_none());
+    }
+
+    /// Phase 7: collecting a health upgrade and
+    /// then completing the level persists the new
+    /// level (ho) and the `he` bit to the save
+    /// (the port previously never synced these).
+    #[test]
+    fn upgrade_persists_ho_and_he_on_level_complete() {
+        let mut game = Game::new("../extracted");
+        game.boot().unwrap();
+        game.state = State::Playing;
+        game.playing_level = Some(19456);
+        game.playing_arena = false;
+        game.enter_playing();
+        assert!(game.gameplay.is_some());
+        // Teleport onto the health upgrade and let
+        // the interstitial run out.
+        {
+            let gp = game.gameplay.as_mut().unwrap();
+            let (ux, uy) = gp
+                .collectibles
+                .iter()
+                .find(|it| it.kind == 3 && it.value > 0)
+                .map(|it| (it.x, it.y))
+                .expect("19456 has a health upgrade");
+            gp.player.ga = ux;
+            gp.player.gb = uy + 8;
+        }
+        for _ in 0..80 {
+            game.gameplay_tick();
+        }
+        assert!(!game.gameplay.as_ref().unwrap().upgrade_active(), "interstitial finished");
+        assert_eq!(game.gameplay.as_ref().unwrap().health_level, 1);
+        // Simulate the level completing, then Select
+        // past the interstitial (which syncs + saves).
+        if let Some(gp) = &mut game.gameplay {
+            gp.level_complete = Some(2);
+        }
+        game.handle_level_complete();
+        assert_eq!(game.state, State::LevelComplete);
+        game.update(Some(Input::Select));
+        assert_eq!(game.save.ho, 1, "ho persisted");
+        // 19456 is level index 1: health bit 1<<1.
+        assert_eq!(game.save.he & (1 << 1), 1 << 1, "`he` bit persisted");
+    }
+
+    /// Phase 7: an upgrade whose `he` bit is already
+    /// set in the save starts collected on level
+    /// entry, so it cannot be granted twice.
+    #[test]
+    fn he_bit_prevents_recollect_on_entry() {
+        let mut game = Game::new("../extracted");
+        game.boot().unwrap();
+        // 19456 is level index 1: health bit 1<<1.
+        game.save.he = 1 << 1;
+        game.state = State::Playing;
+        game.playing_level = Some(19456);
+        game.playing_arena = false;
+        game.enter_playing();
+        let gp = game.gameplay.as_ref().unwrap();
+        let health = gp
+            .collectibles
+            .iter()
+            .find(|it| it.kind == 3 && it.value > 0)
+            .expect("19456 has a health upgrade");
+        assert!(health.collected, "health upgrade starts collected with the bit set");
+    }
 
 
 #[cfg(test)]

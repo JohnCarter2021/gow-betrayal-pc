@@ -2,12 +2,14 @@
 
 A Rust PC port, in progress, of *God of War: Betrayal* (J2ME, Glu Mobile, v1.4.8).
 
-Status, 2026-11-05 — v1.1.0: everything in v1.0.0, plus Phase 6
-complete (combat polish — hurt reactions 5/7/100, block poses
-27/28 with Up-while-blocking exit, death/stagger root-motion
-slide, heavy stagger variants 7/9/8, dX cooldown + slot-137
-stagger indicator, HUD weapon icon per mode, fire-while-
-grabbing release):
+Status, 2026-11-05 — v1.2.0: everything in v1.1.0, plus Phase 7
+complete (death and the "You Are Dead" screen — state 108 with
+Arena kills/record and checkpoint respawn; Arena best score
+`hz` saved on death; Arena wave respawn — dead enemies count
+down and respawn at their spawn point; state-104 upgrade
+interstitial — the max grows 3/tick for 64 ticks; upgrade
+levels and the `he` bit now sync to the save; enemy damage
+clamps health at 0):
 
 - **MIDP shim, std-only, no crates:** 240×320 framebuffer, `Graphics`
   (clip / translate / `drawRegion` with all 8 MIDP transforms), sprite

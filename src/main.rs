@@ -502,6 +502,7 @@ fn main() {
         };
         let mut script_engine = script::ScriptEngine::new(script_triggers, script_strings);
         let mut play_completed = false;
+        let mut play_died = false;
         for key in &keys {
             let mut attack_pressed = false;
             match key.as_str() {
@@ -763,6 +764,12 @@ fn main() {
                                         );
                                     } else {
                                         pl.health -= dmg;
+                                        // The original clamps health
+                                        // at 0 at both damage sites
+                                        // (e.java:5807 and 6618).
+                                        if pl.health < 0 {
+                                            pl.health = 0;
+                                        }
                                         println!(
                                             "enemy {} hits player for {} (player health {}/{})",
                                             st.enemy.index, dmg, pl.health, pl.max_health
@@ -879,6 +886,17 @@ fn main() {
                         parsed.level.pixel_height() as i32,
                         held,
                     );
+                    // Death (Phase 7): action 52 has
+                    // ended; the death screen would show
+                    // here in Game (state 108). Print
+                    // once, then keep ticking (the world
+                    // is frozen on the death screen in
+                    // the real game, but --play is a
+                    // scripted driver, so it continues).
+                    if pl.death_finished && !play_died {
+                        play_died = true;
+                        println!("YOU ARE DEAD (action 52 finished)");
+                    }
                     // Box slots + slide, then the grab
                     // check (after the walk stopped at
                     // the box face).
@@ -1189,8 +1207,8 @@ fn main() {
         )
         .expect("write play frame");
         println!(
-            "player final: ga={} gb={} action={} visual={} cam=({},{}) health={}/{} gold={} orbs={} completed={} intro={} wrote {prefix}.png",
-            pl.ga, pl.gb, pl.action, pl.slot.visual, pl.cam_x, pl.cam_y, pl.health, pl.max_health, gold, pickups.orbs.len(), play_completed, intro_text.is_some()
+            "player final: ga={} gb={} action={} visual={} cam=({},{}) health={}/{} gold={} orbs={} completed={} died={} intro={} wrote {prefix}.png",
+            pl.ga, pl.gb, pl.action, pl.slot.visual, pl.cam_x, pl.cam_y, pl.health, pl.max_health, gold, pickups.orbs.len(), play_completed, play_died, intro_text.is_some()
         );
         return;
     }

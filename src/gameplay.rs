@@ -177,6 +177,63 @@ pub struct Gameplay {
     /// has a tile position and, per enemy index,
     /// a new spawn point (eE, eF) and a flag (eG).
     respawn_triggers: Vec<RespawnTrigger>,
+    /// Checkpoint (Phase 7, `fY`/`fZ`/`hv`): the
+    /// respawn point, set to the spawn at level
+    /// load (`d(26)`) and updated whenever the
+    /// player stands on a flag-1024 tile (type-25,
+    /// the `g()` handler). Death respawns here.
+    checkpoint_x: i32,
+    checkpoint_y: i32,
+    checkpoint_facing: bool,
+    /// Death finished (Phase 7): the player's
+    /// action-52 animation has ended, so the
+    /// caller (Game) shows the death screen
+    /// (state 108). Set in tick when
+    /// `player.death_finished` first becomes true.
+    pub death_finished: bool,
+    /// Upgrade interstitial (Phase 7, state 104):
+    /// `Some` while the Gorgon Eye / Phoenix
+    /// Feather animation plays; the world is
+    /// frozen (tick advances only the interstitial)
+    /// until its timer runs out.
+    upgrade: Option<UpgradeState>,
+    /// Slot-136 animation for the interstitial
+    /// (anim set 1026 action 0 = health, 1 =
+    /// magic; `fu` = sprite set 1038). None when
+    /// either set fails to load (the interstitial
+    /// still runs, but draws no icon).
+    upgrade_bar: Option<BarState>,
+    /// Corner ornaments for the interstitial box
+    /// (`cq` = sprite set 1030). None when the
+    /// set fails to load.
+    upgrade_corners: Option<SpriteSet>,
+    /// Upgrade `he` bit pending (Phase 7): set to
+    /// `Some(true)` for a health upgrade or
+    /// `Some(false)` for a magic upgrade when one
+    /// is collected; the caller (Game) applies it
+    /// to the save (`he |= 1 << bC` / `<< 10`)
+    /// and clears it. The bit is set at collection
+    /// (e.java:5442/5449), before the interstitial.
+    pub pending_he_health: Option<bool>,
+    /// Full string table (English by default; Game
+    /// replaces it on a language change): the
+    /// interstitial (state 104) draws strings
+    /// 147/148/151/158/189 from it.
+    strings: Vec<String>,
+}
+
+/// One upgrade interstitial (Phase 7, state 104).
+struct UpgradeState {
+    /// `fv`: true = health (Gorgon Eye, string
+    /// 147), false = magic (Phoenix Feather, 148).
+    health: bool,
+    /// `fw`: the countdown, 192 down by 3 per tick
+    /// (~2.5 s). At 0 the interstitial ends.
+    timer: i32,
+    /// The max the interstitial grows toward:
+    /// (new level) * 192 + 1024. The current max
+    /// rises by 3 per tick toward this.
+    target_max: i32,
 }
 
 /// One flag-4 respawn trigger (Phase 4, type-14).
@@ -214,7 +271,11 @@ impl Gameplay {
             .and_then(|g| g.positions.first().copied())
             .ok_or("no player spawn (type 26)")?;
         let (start_cam_x, start_cam_y) = entities::start_camera(&parsed.level, spawn);
-        let mut player = Player::new(&player_anim, spawn, parsed.level.facing_right, start_cam_x, start_cam_y);
+        // The checkpoint starts at the spawn (Phase
+        // 7, `d(26)`); capture the facing before
+        // `parsed` moves into the struct below.
+        let spawn_facing = parsed.level.facing_right;
+        let mut player = Player::new(&player_anim, spawn, spawn_facing, start_cam_x, start_cam_y);
         player.health = 1024;
         player.max_health = 1024;
         // Type-3 camera zones (slice 23).
@@ -284,6 +345,29 @@ impl Gameplay {
             }
             _ => None,
         };
+        // Upgrade-interstitial sets (Phase 7, state
+        // 104): anim set 1026 (actions 0 = health,
+        // 1 = magic) + sprite set 1038 (`fu`), slot
+        // 136 (e.java:5446/5454 `a(136, 1026, 0/1)`).
+        // The slot action is set when the interstitial
+        // starts; the initial action here is a
+        // placeholder (0). Corner ornaments `cq` =
+        // sprite set 1030.
+        let upgrade_bar = match (
+            res.chunk(1026).ok().and_then(|c| anim::load_anim_set(&c).ok()),
+            res.sprite_set(1038, None).ok(),
+        ) {
+            (Some(anim_set), Some(sprites)) => {
+                let slot = crate::anim::AnimSlot::new(&anim_set, 0);
+                Some(BarState {
+                    anim: anim_set,
+                    sprites,
+                    slot,
+                })
+            }
+            _ => None,
+        };
+        let upgrade_corners = res.sprite_set(1030, None).ok();
         // Type-27 boxes (slice 22): anim set 6144 +
         // sprite set 6146 with the level palette key
         // (6150 + bG[i]).
@@ -417,7 +501,7 @@ impl Gameplay {
                     .map(|d| d.subsec_nanos() ^ (d.as_secs() as u32))
                     .unwrap_or(0x9E3779B9),
             ),
-            script: ScriptEngine::new(triggers, strings),
+            script: ScriptEngine::new(triggers, strings.clone()),
             level_complete: None,
             menu: None,
             kills: 0,
@@ -444,6 +528,17 @@ impl Gameplay {
             cutscene_target,
             cutscene_active: false,
             respawn_triggers,
+            // Checkpoint (Phase 7, `d(26)`): the
+            // respawn point starts at the spawn.
+            checkpoint_x: spawn.0,
+            checkpoint_y: spawn.1,
+            checkpoint_facing: spawn_facing,
+            death_finished: false,
+            upgrade: None,
+            upgrade_bar,
+            upgrade_corners,
+            pending_he_health: None,
+            strings: strings.clone(),
         })
     }
 
@@ -452,6 +547,7 @@ impl Gameplay {
     /// intro dialog text (slice 15).
     pub fn set_strings(&mut self, strings: Vec<String>) {
         self.intro_text = self.intro_index.and_then(|i| strings.get(i).cloned());
+        self.strings = strings.clone();
         self.script.set_strings(strings);
     }
 
@@ -824,6 +920,14 @@ impl Gameplay {
         if self.script.active() {
             return;
         }
+        // Upgrade interstitial (Phase 7, state 104):
+        // the world is frozen while it plays; only
+        // the interstitial itself advances (its
+        // timer, the max growth, the slot-136 icon).
+        if self.upgrade.is_some() {
+            self.tick_upgrade();
+            return;
+        }
         // Climb turn (slice 21): Left/Right pressed
         // opposite to the facing while holding (33)
         // flips the player around the wall (44).
@@ -953,12 +1057,30 @@ impl Gameplay {
                                 anim::AnimSlot::new(&self.player_anim, 97);
                         } else {
                             self.player.health -= dmg;
+                            // The original clamps health at 0
+                            // at both damage sites (e.java:5807
+                            // and 6618: `if (hj < 0) hj = 0`).
+                            // Without this a dead player keeps
+                            // taking damage into the negatives
+                            // while action 52 plays out.
+                            if self.player.health < 0 {
+                                self.player.health = 0;
+                            }
                             last_attacker_facing = Some(!st.facing_right);
                         }
                     }
                 }
             }
         }
+        // Enemy respawn (Phase 7, e.java:6334-6367):
+        // dead enemies count their `er` timer down
+        // and respawn at their spawn point when it
+        // runs out (gated on respawn count, orb
+        // count, distance from the player, and a
+        // clear tile above the spawn). In the Arena
+        // (`iN`) the count is ignored — waves are
+        // endless.
+        self.check_enemy_respawn();
         // Hurt reactions (Phase 6, e.java:5378-5382):
         // the deferred check after the damage lands.
         // Guards: grounded (not 24/25/26, not
@@ -1095,6 +1217,12 @@ impl Gameplay {
         }
         self.prev_dir = dir;
         self.player.tick(&self.player_anim, &self.flags, w, h, dir);
+        // Death finished (Phase 7): the action-52
+        // animation has ended; the caller (Game)
+        // shows the death screen (state 108).
+        if self.player.death_finished {
+            self.death_finished = true;
+        }
         // Box slots + slide (the original's per-frame
         // box update); the grab check runs after the
         // player tick, when the walk has stopped at
@@ -1162,6 +1290,16 @@ impl Gameplay {
             // crossing a flag-4 tile refreshes
             // off-screen enemies to new spawn points.
             self.check_respawn(tx, ty);
+            // Checkpoint (Phase 7, type-25, the
+            // `g()` flag-1024 handler): standing on
+            // a flag-1024 tile sets the respawn point
+            // (fY/fZ) to this tile and the facing
+            // (hv) to the current facing.
+            if self.flags.get(tx, ty) & 1024 != 0 {
+                self.checkpoint_x = tx * 16;
+                self.checkpoint_y = ty * 16;
+                self.checkpoint_facing = self.player.facing_right;
+            }
             // Type-28 rectangle door trigger (Phase 5):
             // standing on a flag-32 tile inside a
             // rect toggles its door (up to count times).
@@ -1189,14 +1327,19 @@ impl Gameplay {
                         self.pickups.spawn(x, y, kind, value, &mut self.rng);
                     }
                     crate::collectibles::CollectOutcome::HealthUpgrade => {
+                        // Phase 7, state 104: the level
+                        // rises now, but the max grows
+                        // gradually in the interstitial
+                        // (and the `he` bit is set at
+                        // collection, e.java:5442).
                         self.health_level += 1;
-                        self.player.max_health = self.health_level * 192 + 1024;
-                        self.player.health = self.player.max_health;
+                        self.pending_he_health = Some(true);
+                        self.start_upgrade(true);
                     }
                     crate::collectibles::CollectOutcome::MagicUpgrade => {
                         self.magic_level += 1;
-                        self.max_magic = self.magic_level * 192 + 1024;
-                        self.magic = self.max_magic;
+                        self.pending_he_health = Some(false);
+                        self.start_upgrade(false);
                     }
                 }
             }
@@ -1204,6 +1347,138 @@ impl Gameplay {
         // End of tick (Phase 6): record the player's
         // health for next tick's hurt check (`hk`).
         self.prev_player_health = self.player.health;
+    }
+
+    /// Start the upgrade interstitial (Phase 7,
+    /// state 104): `health` selects the Gorgon Eye
+    /// (string 147, slot-136 action 0) or the
+    /// Phoenix Feather (string 148, action 1). The
+    /// target max is the new level's max; the
+    /// current max grows toward it by 3 per tick
+    /// inside `tick_upgrade`.
+    fn start_upgrade(&mut self, health: bool) {
+        let target_max = if health {
+            self.health_level * 192 + 1024
+        } else {
+            self.magic_level * 192 + 1024
+        };
+        self.upgrade = Some(UpgradeState {
+            health,
+            timer: 192,
+            target_max,
+        });
+        if let Some(bar) = &mut self.upgrade_bar {
+            let BarState { anim, slot, .. } = bar;
+            let action = if health { 0 } else { 1 };
+            *slot = crate::anim::AnimSlot::new(anim, action);
+        }
+    }
+
+    /// One interstitial tick (Phase 7, e.java:936-960,
+    /// the state-104 update): the max grows by 3
+    /// toward the target and the current health /
+    /// magic grows by max/64 (clamped); the slot-136
+    /// icon advances 40 ms; the timer drops by 3.
+    /// At 0 the interstitial ends — health clamps
+    /// to the max, magic refills to the max — and
+    /// the world resumes.
+    fn tick_upgrade(&mut self) {
+        let Some(up) = &mut self.upgrade else {
+            return;
+        };
+        if up.health {
+            if self.player.max_health < up.target_max {
+                self.player.max_health = (self.player.max_health + 3).min(up.target_max);
+            }
+            self.player.health =
+                (self.player.health + self.player.max_health / 64).min(self.player.max_health);
+        } else {
+            if self.max_magic < up.target_max {
+                self.max_magic = (self.max_magic + 3).min(up.target_max);
+            }
+            self.magic = (self.magic + self.max_magic / 64).min(self.max_magic);
+        }
+        if let Some(bar) = &mut self.upgrade_bar {
+            let BarState { anim, slot, .. } = bar;
+            slot.advance(anim, 40);
+        }
+        up.timer -= 3;
+        if up.timer <= 0 {
+            if up.health {
+                if self.player.health > self.player.max_health {
+                    self.player.health = self.player.max_health;
+                }
+            } else {
+                self.magic = self.max_magic;
+            }
+            self.upgrade = None;
+        }
+    }
+
+    /// True while the upgrade interstitial (state
+    /// 104) is showing: the caller (Game) routes
+    /// no gameplay input while it is up.
+    pub fn upgrade_active(&self) -> bool {
+        self.upgrade.is_some()
+    }
+
+    /// Mark already-collected upgrades (Phase 7,
+    /// the `he` bitmask at type-4 load, e.java:3288):
+    /// an upgrade item whose bit is set in `he`
+    /// (`1 << bC` for health, `1 << bC << 10` for
+    /// magic) starts collected, so it cannot be
+    /// granted twice. Called by Game after load,
+    /// with the save's `he`.
+    pub fn mark_collected_upgrades(&mut self, he: i32) {
+        let bit = 1 << self.level_index;
+        for it in &mut self.collectibles {
+            if it.kind != 3 {
+                continue;
+            }
+            let health_bit = it.value > 0;
+            let set = if health_bit {
+                he & bit == bit
+            } else {
+                he & (bit << 10) == (bit << 10)
+            };
+            if set {
+                it.collected = true;
+            }
+        }
+    }
+
+    /// Respawn at the checkpoint (Phase 7,
+    /// e.java:1257-1279, the death screen's
+    /// Attack/Select in a level): position and
+    /// facing restore to the checkpoint, health
+    /// and magic refill to the maxima, the block
+    /// clears, the player idles, and the camera
+    /// recentres on the checkpoint. Called by Game
+    /// when leaving the death screen.
+    pub fn respawn_at_checkpoint(&mut self) {
+        self.player.ga = self.checkpoint_x;
+        self.player.gb = self.checkpoint_y;
+        self.player.facing_right = self.checkpoint_facing;
+        self.player.blocking = false;
+        self.player.action = 0;
+        self.player.slot = crate::anim::AnimSlot::new(&self.player_anim, 0);
+        self.player.death_finished = false;
+        self.death_finished = false;
+        self.player.health = self.player.max_health;
+        self.magic = self.max_magic;
+        self.prev_player_health = self.player.health;
+        // Camera: `iQ = ga - 120 - ((hu ? 1 : -1) *
+        // 240 >> 2)`, `iR = gb - 266` — the port's
+        // update_camera target for the new spot.
+        let target_x = self.player.ga - 120
+            + if self.player.facing_right { 60 } else { -60 };
+        let target_y = self.player.gb - 266;
+        let w = self.parsed.level.pixel_width() as i32;
+        let h = self.parsed.level.pixel_height() as i32;
+        self.player.snap_camera(
+            target_x.clamp(0, (w - 240).max(0)),
+            target_y.clamp(0, (h - 320).max(0)),
+        );
     }
 
     /// Flag-4 respawn (Phase 4, type-14): when the
@@ -1227,6 +1502,12 @@ impl Gameplay {
         };
         let trigger = &self.respawn_triggers[ti];
         let (cam_x, cam_y) = (self.player.cam_x, self.player.cam_y);
+        // The original's flag-4 handler resets every
+        // enemy's respawn counter (`ec = ed`, Phase 7,
+        // e.java:4049) before the per-enemy refresh.
+        for st in &mut self.enemy_states {
+            st.enemy.ec = st.ed;
+        }
         for st in &mut self.enemy_states {
             if st.dead || st.dying {
                 continue;
@@ -1261,6 +1542,64 @@ impl Gameplay {
         // Clear flag 4 for the trigger's tiles.
         for y in trigger.tile_y..=trigger.tile_y + trigger.len as i32 {
             self.flags.clear_flag(trigger.tile_x, y, 4);
+        }
+    }
+
+    /// Enemy respawn (Phase 7, e.java:6334-6367): for
+    /// each dead enemy (`dT < 0`), count the `er`
+    /// timer down by 40 per tick; when it reaches 0
+    /// and the gates hold (respawn count left, or
+    /// the Arena, where the count is ignored; fewer
+    /// than 10 damage orbs; the spawn point more
+    /// than 32 px from the player in either axis)
+    /// the enemy respawns at its spawn point at full
+    /// health, idle — if the tile above the spawn is
+    /// clear (neither flag 1 nor flag 2); otherwise
+    /// the timer resets to 1500 ms and retries. The
+    /// respawn also sets flag 2 above the spawn.
+    /// The port respawns straight to idle (action 0)
+    /// — the original's spawn-in animations
+    /// (14/18/27) are a documented gap (Phase 8).
+    fn check_enemy_respawn(&mut self) {
+        let (ga, gb) = (self.player.ga, self.player.gb);
+        let orbs = self.pickups.orbs.len();
+        for st in &mut self.enemy_states {
+            if !st.dead {
+                continue;
+            }
+            // Levels stop respawning when the count
+            // is exhausted; the Arena ignores it.
+            if !self.arena && st.enemy.ec <= 0 {
+                continue;
+            }
+            st.er -= 40;
+            if st.er > 0 {
+                continue;
+            }
+            if orbs >= 10 {
+                continue;
+            }
+            let (sx, sy) = (st.enemy.x, st.enemy.y);
+            if (sx - ga).abs() <= 32 && (sy - gb).abs() <= 32 {
+                continue;
+            }
+            let above = self.flags.get(sx / 16, sy / 16 - 1);
+            if above & 1 == 0 && above & 2 == 0 {
+                st.enemy.ec -= 1;
+                st.er = st.enemy.et;
+                st.x = sx;
+                st.y = sy;
+                st.health = st.max_health;
+                st.action = 0;
+                st.dead = false;
+                st.dying = false;
+                if let Some(anim_set) = &st.anim_set {
+                    st.slot = anim::AnimSlot::new(anim_set, 0);
+                }
+                self.flags.set_flag(sx / 16, sy / 16 - 1, 2);
+            } else {
+                st.er = 1500;
+            }
         }
     }
 
@@ -1412,7 +1751,96 @@ impl Gameplay {
         if let Some(text) = &self.intro_text {
             draw_dialog_box(fb, font, text);
         }
+        // Upgrade interstitial (Phase 7, state 104):
+        // framed box + slot-136 icon + two centred
+        // lines, on top of the frozen world.
+        if self.upgrade.is_some() {
+            self.draw_upgrade(fb, font);
+        }
     }
+
+    /// Draw the upgrade interstitial (Phase 7,
+    /// e.java:2050-2075): the framed box
+    /// (fill 855564, borders 4269080/5911589),
+    /// the `cq` corner ornaments (sprite set 1030,
+    /// frames 0/2/1/3), the slot-136 icon at
+    /// (120, 108), and two centred lines — the
+    /// found title (147/148) at y=186 and the
+    /// outcome (151, or 158/189 while fw < 96)
+    /// at y=238. Screen coordinates, not
+    /// camera-translated.
+    fn draw_upgrade(&self, fb: &mut Framebuffer, font: &Font) {
+        let Some(up) = &self.upgrade else {
+            return;
+        };
+        let g = Graphics::default();
+        let mut gg = g;
+        // Fill (13, 14, 12) = 855564.
+        gg.set_color_rgb(13, 14, 12);
+        gg.fill_rect(fb, 15, 80, 210, 186);
+        // Border 4269080 = (65, 36, 24).
+        gg.set_color_rgb(65, 36, 24);
+        draw_rect_outline(&gg, fb, 14, 79, 211, 187);
+        // Border 5911589 = (90, 52, 37).
+        gg.set_color_rgb(90, 52, 37);
+        draw_rect_outline(&gg, fb, 13, 78, 213, 189);
+        // Corner ornaments `cq` (sprite set 1030).
+        if let Some(corners) = &self.upgrade_corners {
+            for (frame_idx, (x, y)) in [
+                (0, (12, 78)),
+                (2, (228, 78)),
+                (1, (12, 268)),
+                (3, (228, 268)),
+            ] {
+                if let Some(frame) = corners.frame(frame_idx) {
+                    midp::draw_sprite_frame(&g, fb, &corners.image, frame, x, y, 0);
+                }
+            }
+        }
+        // Slot-136 icon (anim set 1026, sprite set
+        // 1038) at (120, 108).
+        if let Some(bar) = &self.upgrade_bar {
+            let action = if up.health { 0 } else { 1 };
+            if let Ok(frames) = anim::frames_for_timeline_frame(&bar.anim, action, bar.slot.visual, 0) {
+                for fr in frames {
+                    if let Some(frame) = bar.sprites.frame(fr.sprite_idx) {
+                        midp::draw_sprite_frame(
+                            &g,
+                            fb,
+                            &bar.sprites.image,
+                            frame,
+                            120 + fr.dx,
+                            108 + fr.dy,
+                            fr.transform,
+                        );
+                    }
+                }
+            }
+        }
+        // Two centred lines (anchor 1 = HCENTER).
+        let title = self.strings.get(if up.health { 147 } else { 148 });
+        if let Some(title) = title {
+            font.draw(&g, fb, title, 120, 186, 1);
+        }
+        let sub_idx = if up.timer < 96 {
+            if up.health { 158 } else { 189 }
+        } else {
+            151
+        };
+        if let Some(sub) = self.strings.get(sub_idx) {
+            font.draw(&g, fb, sub, 120, 238, 1);
+        }
+    }
+}
+
+/// Draw a 1 px rectangle outline with `fill_rect`
+/// (the port's Graphics has no draw_rect): the
+/// MIDP drawRect spans x..x+w-1, y..y+h-1.
+fn draw_rect_outline(g: &Graphics, fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32) {
+    g.fill_rect(fb, x, y, w, 1);
+    g.fill_rect(fb, x, y + h - 1, w, 1);
+    g.fill_rect(fb, x, y, 1, h);
+    g.fill_rect(fb, x + w - 1, y, 1, h);
 }
 
 /// Draw a full-screen dialog box (audio-prompt
@@ -2614,8 +3042,11 @@ mod tests {
     fn collectible_upgrade_raises_max_and_refills() {
         // Phase 5, type-4: level 19456's health
         // upgrade at tile (91,12) is ft=3 fs=1.
-        // Touching it raises max health by 192 and
-        // refills health to the new max.
+        // Touching it raises the level at once and
+        // starts the state-104 interstitial (Phase 7),
+        // which grows the max by 3 per tick to 1216
+        // and refills health to the new max when it
+        // ends (~64 ticks), not instantly.
         let mut res = crate::resources::Resources::new("../extracted");
         let mut gp = super::Gameplay::load(&mut res, 19456, false).unwrap();
         gp.dismiss_intro();
@@ -2626,6 +3057,12 @@ mod tests {
         gp.player.action = 0;
         gp.tick(&mut res, 0, false);
         assert_eq!(gp.health_level, 1);
+        assert!(gp.upgrade_active(), "interstitial starts on collection");
+        assert_eq!(gp.player.max_health, 1024, "max grows gradually, not at once");
+        for _ in 0..70 {
+            gp.tick(&mut res, 0, false);
+        }
+        assert!(!gp.upgrade_active(), "interstitial ends after ~64 ticks");
         assert_eq!(gp.player.max_health, 1216, "ho 0->1 raises max to 1216");
         assert_eq!(gp.player.health, 1216, "health refills to the new max");
     }
@@ -2815,6 +3252,190 @@ mod tests {
         assert_eq!(gp.boxes[1].x, 130 * 16, "box slid to its new tile: {}", gp.boxes[1].x);
     }
 
+    /// Phase 7: death on the ground plays action 52
+    /// and, when its animation ends, sets
+    /// `death_finished` (the caller shows state
+    /// 108). The player is killed by setting health
+    /// to 0 on a floor tile away from the spawn
+    /// (the spawn-area prayer script would
+    /// otherwise overwrite the action with its
+    /// cutscene).
+    #[test]
+    fn death_grounded_plays_52_then_finishes() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        gp.player.ga = 100 * 16;
+        gp.player.gb = 35 * 16;
+        gp.player.health = 0;
+        t(&mut gp, &mut res, 0, false);
+        assert_eq!(gp.player.action, 52, "grounded death plays action 52");
+        assert!(!gp.death_finished, "not finished on the first tick");
+        let mut finished = false;
+        for _ in 0..100 {
+            t(&mut gp, &mut res, 0, false);
+            if gp.death_finished {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished, "action 52 ends within 100 ticks (~4 s)");
+        assert!(gp.player.death_finished);
+    }
+
+    /// Phase 7: death in the air plays the fall
+    /// (action 26) first, then 52 on landing. The
+    /// player is teleported above the floor with
+    /// health 0.
+    #[test]
+    fn death_airborne_falls_then_plays_52() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        gp.player.ga = 100 * 16;
+        gp.player.gb = 30 * 16;
+        gp.player.health = 0;
+        t(&mut gp, &mut res, 0, false);
+        assert_eq!(gp.player.action, 26, "airborne death falls first");
+        let mut played_52 = false;
+        for _ in 0..100 {
+            t(&mut gp, &mut res, 0, false);
+            if gp.player.action == 52 {
+                played_52 = true;
+                break;
+            }
+        }
+        assert!(played_52, "52 plays after landing");
+    }
+
+    /// Phase 7: standing on a flag-1024 tile
+    /// (type-25) sets the checkpoint. Level 9217
+    /// has a type-25 column at tile x=70, y 28-33.
+    #[test]
+    fn checkpoint_updates_on_flag_1024() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        assert_eq!((gp.checkpoint_x, gp.checkpoint_y), (48, 560), "checkpoint starts at spawn");
+        gp.player.ga = 70 * 16;
+        gp.player.gb = 28 * 16;
+        t(&mut gp, &mut res, 0, false);
+        assert_eq!(gp.checkpoint_x, 70 * 16, "checkpoint x follows the flag tile");
+        assert_eq!(gp.checkpoint_y, 28 * 16, "checkpoint y follows the flag tile");
+        assert!(gp.checkpoint_facing, "facing recorded from the player");
+    }
+
+    /// Phase 7: a dead Arena enemy respawns after
+    /// its timer runs out — the Arena ignores the
+    /// respawn count, so it comes back even with
+    /// `ec` exhausted. The player is moved far
+    /// away so the distance gate holds.
+    #[test]
+    fn arena_enemy_respawns_after_timer() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9216, true).unwrap();
+        let st = &mut gp.enemy_states[0];
+        st.dead = true;
+        st.enemy.ec = 0;
+        st.er = 40;
+        let (sx, sy) = (st.enemy.x, st.enemy.y);
+        gp.player.ga = 0;
+        gp.player.gb = 0;
+        t(&mut gp, &mut res, 0, false);
+        let st = &gp.enemy_states[0];
+        assert!(!st.dead, "Arena enemy respawns when the timer runs out");
+        assert_eq!(st.health, st.max_health, "respawned at full health");
+        assert_eq!((st.x, st.y), (sx, sy), "respawned at its spawn point");
+        assert_eq!(st.action, 0, "respawned idle (spawn-in anims not ported)");
+    }
+
+    /// Phase 7: a dead level enemy with an
+    /// exhausted respawn count stays dead.
+    #[test]
+    fn level_enemy_no_respawn_when_ec_exhausted() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        let st = &mut gp.enemy_states[0];
+        st.dead = true;
+        st.enemy.ec = 0;
+        st.er = 40;
+        t(&mut gp, &mut res, 0, false);
+        assert!(gp.enemy_states[0].dead, "exhausted count: no respawn");
+    }
+
+    /// Phase 7: a dead level enemy with count left
+    /// respawns after its timer. The player is
+    /// moved far away so the distance gate holds.
+    #[test]
+    fn level_enemy_respawns_with_count_left() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        let st = &mut gp.enemy_states[0];
+        st.dead = true;
+        st.enemy.ec = 2;
+        st.er = 40;
+        gp.player.ga = 0;
+        gp.player.gb = 0;
+        t(&mut gp, &mut res, 0, false);
+        let st = &gp.enemy_states[0];
+        assert!(!st.dead, "count left: respawns");
+        assert_eq!(st.enemy.ec, 1, "respawn consumes one count");
+    }
+
+    /// Phase 7: the state-104 interstitial grows
+    /// the max by 3 per tick and ends after 64
+    /// ticks with the max up by 192 and health
+    /// refilled. Level 19456 has a health upgrade;
+    /// the player teleports onto it.
+    #[test]
+    fn upgrade_interstitial_grows_max_and_ends() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 19456, false).unwrap();
+        let (ux, uy) = gp
+            .collectibles
+            .iter()
+            .find(|it| it.kind == 3 && it.value > 0)
+            .map(|it| (it.x, it.y))
+            .expect("19456 has a health upgrade");
+        gp.player.ga = ux;
+        gp.player.gb = uy + 8;
+        t(&mut gp, &mut res, 0, false);
+        assert!(gp.upgrade_active(), "collecting the upgrade starts the interstitial");
+        assert_eq!(gp.health_level, 1, "level rises at collection");
+        assert_eq!(gp.pending_he_health, Some(true), "`he` bit pending for the save");
+        assert_eq!(gp.player.max_health, 1024, "max not yet grown on the first tick");
+        for _ in 0..70 {
+            t(&mut gp, &mut res, 0, false);
+        }
+        assert!(!gp.upgrade_active(), "interstitial ends after ~64 ticks");
+        assert_eq!(gp.player.max_health, 1216, "max grew by 192");
+        assert_eq!(gp.player.health, 1216, "health refilled to the new max");
+    }
+
+    /// Phase 7: `mark_collected_upgrades` starts an
+    /// already-collected upgrade as collected, so
+    /// it cannot be granted twice.
+    #[test]
+    fn he_bit_marks_upgrade_collected() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 19456, false).unwrap();
+        // 19456 is level index 1: health bit 1<<1.
+        gp.mark_collected_upgrades(1 << 1);
+        let health = gp
+            .collectibles
+            .iter()
+            .find(|it| it.kind == 3 && it.value > 0)
+            .expect("19456 has a health upgrade");
+        assert!(health.collected, "health upgrade starts collected with the bit set");
+        let magic = gp
+            .collectibles
+            .iter()
+            .find(|it| it.kind == 3 && it.value == 0)
+            .expect("19456 has a magic upgrade");
+        assert!(!magic.collected, "magic upgrade untouched by the health bit");
+    }
 }
 
 #[cfg(test)]

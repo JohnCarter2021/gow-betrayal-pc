@@ -381,6 +381,11 @@ pub struct Player {
     /// flag 8192 at this row so the drop goes
     /// through instead of landing back on it.
     pub drop_platform_row: Option<i32>,
+    /// Death animation (action 52, Phase 7) has
+    /// finished playing: the caller (Gameplay) moves
+    /// to the death screen (state 108). Set only by
+    /// the action-52 tick branch.
+    pub death_finished: bool,
 }
 
 impl Player {
@@ -417,6 +422,7 @@ impl Player {
             grabbed_box: None,
             push_pull: 0,
             drop_platform_row: None,
+            death_finished: false,
             cam_zone_i: 0,
             cam_zone_j: 0,
             camera_zones: Vec::new(),
@@ -1086,6 +1092,37 @@ impl Player {
     /// Returns the root-motion delta applied (px, signed).
     pub fn tick(&mut self, anim: &AnimSet, flags: &TileFlags, level_w: i32, level_h: i32, dir: i32) -> i32 {
         let mut applied = 0;
+        // Death trigger (Phase 7, e.java:5327-5333,
+        // the `z()` tail after the action-end chain):
+        // health <= 0 (and not grappling — not
+        // ported) starts the death. `gy` is the
+        // GROUNDED flag (the tile below the feet is
+        // solid): grounded and not already dead
+        // (52/53) plays the death action 52 at once
+        // (and pins health to 0); airborne and not
+        // already falling (26) plays the fall.
+        // Pushing/pulling a box (22/23) defers it
+        // (the original's `gk && hB != 21` guard);
+        // holding a box (21) does not.
+        if self.health <= 0
+            && !matches!(self.action, 52 | 53 | 22 | 23)
+        {
+            let grounded = flags.landing_solid(
+                self.tile_x(),
+                self.walk_tile_y() + 1,
+                self.drop_platform_row,
+            );
+            if grounded {
+                self.action = 52;
+                self.slot = AnimSlot::new(anim, 52);
+                self.health = 0;
+            } else if self.action != 26 {
+                self.action = 26;
+                self.slot = AnimSlot::new(anim, 26);
+                self.h_k = 0;
+                self.h_l = 0;
+            }
+        }
         // Attack timer `gF`: accumulates while
         // attacking, else 0 (e.java, end of z()).
         if Self::is_ground_attack(self.action) || Self::is_air_attack(self.action) {
@@ -1207,6 +1244,25 @@ impl Player {
             let target_y = self.gb - 266;
             self.update_camera(target_x, target_y, level_w, level_h);
             return dx;
+        }
+        if self.action == 52 {
+            // Death (Phase 7): an 18-frame one-shot
+            // (set 28672, repeat 1, ~1.6 s, no root
+            // motion). When it ends, `death_finished`
+            // tells the caller to show the death
+            // screen (state 108, e.java:5363:
+            // `hA == 52 && !bl3` — the animation's
+            // repeats are spent). The player stays in
+            // the dead pose until the caller respawns
+            // or quits.
+            self.slot.advance(anim, 40);
+            if self.slot.repeat == 0 {
+                self.death_finished = true;
+            }
+            let target_x = self.ga - 120 + if self.facing_right { 60 } else { -60 };
+            let target_y = self.gb - 266;
+            self.update_camera(target_x, target_y, level_w, level_h);
+            return 0;
         }
         if self.action == 95 {
             // Mode-3 burst cast (Phase 3): a one-shot
@@ -1654,6 +1710,18 @@ impl Player {
         let target_y = self.gb - 266;
         self.update_camera(target_x, target_y, level_w, level_h);
         applied
+    }
+
+    /// Snap the camera to a target (Phase 7, the
+    /// death respawn recentre): sets both the final
+    /// camera and the fixed-point base, so the next
+    /// `update_camera` continues from here instead
+    /// of sliding back.
+    pub fn snap_camera(&mut self, x: i32, y: i32) {
+        self.cam_x = x;
+        self.cam_y = y;
+        self.cam_fx = x << 8;
+        self.cam_fy = y << 8;
     }
 
     fn update_camera(&mut self, target_x: i32, target_y: i32, level_w: i32, level_h: i32) {

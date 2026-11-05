@@ -439,8 +439,10 @@ down, down, Select, Select, and draws the result to
   (`hc`) fires action 94, a channeled cast draining 12 magic
   per tick while attack is pressed, ending on release or at 0
   magic; its hit effect (dX stagger, `fK[gV]`) is deferred
-  to Phase 6 (dX not ported). Magic does not regenerate yet
-  (original: `hl += hn/64`/tick) — it comes only from MAGIC
+  to Phase 6 (dX not ported). Magic does not regenerate
+  (correction, Phase 7: the original has no per-tick
+  `hl += hn/64` — the only `hl +=` sites are state 104
+  and MAGIC-orb collection) — it comes only from MAGIC
   orbs. `cargo test`: 109/109. Windows cross-build OK
   (2,482,068 bytes). Cargo version 0.7.0. v0.7.0 shipped
   2026-11-05 ~15:20 IST (commit 5208b861, release tag v0.7.0).
@@ -481,9 +483,10 @@ down, down, Select, Select, and draws the result to
   save, Exit goes to the menu). `cargo test`: 128/128.
   Windows cross-build OK (2,502,842 bytes). Shipped
   as v1.0.0 (2026-11-05 ~17:26 IST, push commit
-  22d27c95, browser-verified, marked Latest). Gaps:
-  Arena wave respawn untraced, best score / "You Are
-  Dead" screen not ported (no death screen yet).
+  22d27c95, browser-verified, marked Latest). Gaps at
+  the time: Arena wave respawn untraced, best score /
+  "You Are Dead" screen not ported (no death screen
+  yet) — both closed in Phase 7.
 - Phase 6 COMPLETE (2026-11-05): combat polish —
   hurt reactions (5/7/100, damage > 50 turns to face
   the attacker and plays 7), block poses (27 enter,
@@ -503,13 +506,38 @@ down, down, Select, Select, and draws the result to
   go-ahead to ship (v1.1.0 per the plan). Deviation:
   walking out of block on a Left/Right press is NOT
   ported (port uses held dir, not press edges).
+- Phase 7 COMPLETE (2026-11-05): death, Arena
+  completion & the full playthrough — death trigger
+  (grounded → action 52, airborne → 26 then 52;
+  `death_finished` on animation end), "You Are Dead"
+  screen (state 108; Arena adds kills + new-record
+  or "Record: <best>"), checkpoint respawn
+  (flag-1024 tiles set the respawn point; Select
+  respawns there, Exit → menu; Arena Select is a
+  no-op), Arena best `hz` saved on death, Arena
+  wave respawn (dead enemies count `er` down and
+  respawn at their spawn point; count ignored in
+  the Arena; flag-4 resets `ec = ed`), state-104
+  upgrade interstitial (max grows 3/tick for 64
+  ticks; `he` bit + ho/hp/hs now sync to the save
+  before every persist — previously never synced),
+  enemy damage clamps health at 0. `cargo test`:
+  148/148. Windows cross-build OK (2,518,539
+  bytes). Not yet shipped — awaiting a go-ahead to
+  ship (v1.2.0 per the plan). Corrections: magic
+  regeneration does NOT exist in the original (the
+  Phase 3 note was a misreading — the only `hl +=`
+  sites are state 104 and MAGIC-orb collection),
+  and pit death does not exist either (`h()` returns
+  65 out of bounds = solid). Gaps: the single
+  continuous 9217 walk is still unproven (probe
+  reached the roof and stalled at the row-14
+  platform, tile 143); spawn-in anims (14/18/27)
+  are a Phase 8 gap.
+
 ## Next steps (see ../REPORT.md)
 1. Ship Phase 6 (v1.1.0 per the plan) — awaiting go-ahead.
-2. Phase 7: death, Arena completion & the full playthrough
-   (player death + "You Are Dead" screen, Arena best
-   score, checkpoint respawn, Arena wave respawn,
-   state-104 upgrade interstitial, magic regeneration,
-   full playthrough verification).
+2. Ship Phase 7 (v1.2.0 per the plan) — awaiting go-ahead.
 3. Phase 8: grapple, presentation & loose ends.
 
 The original jar is loaded from the user's own copy at runtime; no Glu

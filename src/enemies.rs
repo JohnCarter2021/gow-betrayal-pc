@@ -47,6 +47,16 @@ pub struct Enemy {
     /// Respawn-table index `dY` (Phase 4, extra[6]):
     /// indexes the type-14 trigger's entries.
     pub dy: i32,
+    /// Respawn counter `ec` (Phase 7, extra[0],
+    /// m(3)): how many times this enemy may respawn
+    /// after dying (reset to `ed` by a flag-4
+    /// trigger). Arena (`iN`) ignores it — waves
+    /// are endless there.
+    pub ec: i32,
+    /// Respawn interval `et` (Phase 7, extra[1],
+    /// m(10) * 1000 ms): the countdown between the
+    /// enemy's death and its respawn.
+    pub et: i32,
 }
 
 pub fn enemies(parsed: &LevelEntities) -> Vec<Enemy> {
@@ -99,6 +109,8 @@ pub fn enemies(parsed: &LevelEntities) -> Vec<Enemy> {
                 action: if ev { 1 } else { 0 },
                 cutscene_target: e[2] == 1,
                 dy: e[6] as i32,
+                ec: e[0] as i32,
+                et: e[1] as i32 * 1000,
             });
         }
     }
@@ -496,6 +508,16 @@ pub struct EnemyState {
     /// (e.java:5863/5880); the weakened marker
     /// needs `dX <= 0` (e.java:2571).
     pub dx: i32,
+    /// Respawn counter's initial value `ed`
+    /// (Phase 7, e.java:2805 `ed = ec`): a flag-4
+    /// trigger resets `ec` to this.
+    pub ed: i32,
+    /// Live respawn countdown `er` (Phase 7): set
+    /// to `et` at spawn; counts down by 40 per tick
+    /// while the enemy is dead (`dT < 0`). When it
+    /// reaches 0 (and the other respawn conditions
+    /// hold) the enemy respawns at its spawn point.
+    pub er: i32,
     /// The enemy's anim set (cloned at load, Phase 4):
     /// lets the cutscene set the enemy's action to
     /// an aZ-table entry without a Resources lookup.
@@ -523,6 +545,8 @@ impl EnemyState {
             el,
             eu: 0,
             dx: 0,
+            ed: enemy.ec,
+            er: enemy.et,
             anim_set: None,
             enemy,
         }
