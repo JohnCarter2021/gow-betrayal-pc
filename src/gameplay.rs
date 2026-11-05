@@ -442,6 +442,62 @@ impl Gameplay {
         }
     }
 
+    /// Mode-3 burst fire (Phase 3, `hd`): gate is
+    /// magic > 256 and fewer than 10 active damage
+    /// orbs (`fG < 10`). On fire: action 95, spawn
+    /// type-3 orbs totalling `fL[gW]` from
+    /// `(ga, gb - gD + gD/4)`, flat 256 magic cost,
+    /// reset to blades (`A()`). On a failed gate:
+    /// reset to blades and take a normal swing
+    /// (the original's fall-through to `s(54)`).
+    fn try_fire_mode3(&mut self) {
+        if self.magic > crate::player::Player::MODE3_COST
+            && self.pickups.damage_orb_count() < 10
+        {
+            self.player.attack(&self.player_anim);
+            self.spawn_mode3_orbs();
+            self.magic = (self.magic - crate::player::Player::MODE3_COST).max(0);
+            self.player.unequip_all();
+        } else {
+            self.player.unequip_all();
+            self.player.attack(&self.player_anim);
+        }
+    }
+
+    /// Spawn the mode-3 damage orbs (Phase 3):
+    /// `b(ga, gb - gD + gD/4, 3, fL[gW])`. The
+    /// orbs round-robin their targets over the
+    /// live enemies in the viewport (the
+    /// original's `P[]`), like `b()` does.
+    fn spawn_mode3_orbs(&mut self) {
+        let g_w = self.player.magic_level_mode3.clamp(0, 4) as usize;
+        let value = crate::player::Player::F_L[g_w];
+        let x = self.player.ga;
+        let y = self.player.gb - 34 + 8;
+        // Viewport enemies (the original's rect
+        // is iQ-64, iR-64, 368x448 around the
+        // camera; the port uses the camera rect
+        // expanded by 64 px).
+        let cam_x = self.player.cam_x;
+        let cam_y = self.player.cam_y;
+        let targets: Vec<usize> = self
+            .enemy_states
+            .iter()
+            .enumerate()
+            .filter(|(_, st)| {
+                !st.dead
+                    && st.x >= cam_x - 64
+                    && st.x < cam_x + 240 + 64
+                    && st.y >= cam_y - 64
+                    && st.y < cam_y + 320 + 64
+            })
+            .map(|(i, _)| i)
+            .collect();
+        self.pickups
+            .spawn(x, y, crate::pickups::DAMAGE, value, &mut self.rng);
+        self.pickups.assign_damage_targets(&targets);
+    }
+
     /// One 40 ms tick. `dir`: -1 left, 0 none, +1 right.
     /// `attack`: fire key pressed this frame.
     pub fn tick(&mut self, res: &mut Resources, dir: i32, attack: bool) {
@@ -507,8 +563,37 @@ impl Gameplay {
             // left unequips instead of swinging.
             if self.player.is_artemis() && self.magic <= 0 {
                 self.player.unequip_all();
+            } else if self.player.is_magic_mode3() {
+                // Phase 3: burst magic (hd). Gate:
+                // magic > 256 and fewer than 10 active
+                // damage orbs (fG < 10).
+                self.try_fire_mode3();
+            } else if self.player.is_magic_mode2() {
+                // Phase 3: channeled magic (hc). Gate:
+                // magic > (gV+1)*4. Starts action 94;
+                // the channel drains below.
+                if self.magic > self.player.mode2_start_gate() {
+                    self.player.attack(&self.player_anim);
+                }
             } else {
                 self.player.attack(&self.player_anim);
+            }
+        }
+        // Mode-2 channel (Phase 3): while in action
+        // 94, drain 12 magic per tick while attack
+        // is pressed; end the cast (idle + blades)
+        // when attack is released or magic runs out.
+        // Approximation: the port's attack is a
+        // per-tick press, not a held key, so the
+        // channel continues only while attack presses
+        // keep arriving each tick.
+        if self.player.action == 94 {
+            if attack && self.magic > 0 {
+                self.magic = (self.magic
+                    - crate::player::Player::MODE2_DRAIN_PER_TICK)
+                    .max(0);
+            } else {
+                self.player.end_magic_cast(&self.player_anim);
             }
         }
         if self.combo_timer_ms > 0 {
@@ -1242,10 +1327,17 @@ mod tests {
         assert_eq!(gp.player.weapon_mode, 3);
         assert!(gp.cycle_weapon());
         assert_eq!(gp.player.weapon_mode, 0);
-        // Fire does nothing in a magic mode.
+        // Fire in a magic mode starts the cast
+        // (Phase 3), not a blades swing.
+        gp.magic = 500;
         gp.player.weapon_mode = 2;
-        assert!(!gp.player.attack(&gp.player_anim));
-        assert_eq!(gp.player.action, 0);
+        assert!(gp.player.attack(&gp.player_anim));
+        assert_eq!(gp.player.action, 94);
+        gp.player.end_magic_cast(&gp.player_anim);
+        gp.player.weapon_mode = 3;
+        assert!(gp.player.attack(&gp.player_anim));
+        assert_eq!(gp.player.action, 95);
+        gp.player.end_magic_cast(&gp.player_anim);
         // Cycling is blocked during a ground swing.
         // (Same spawn-tile caveat as above.)
         gp.magic = 100;
@@ -1297,6 +1389,125 @@ mod tests {
         }
         t(&mut gp, &mut res, 0, true);
         assert_eq!(gp.player.action, 54);
+    }
+
+    #[test]
+    fn mode3_cast_spawns_damage_orbs_and_costs_256() {
+        // Mode 3 (hd, Phase 3): fire with magic >
+        // 256 spawns type-3 orbs totalling fL[gW]
+        // (128 at gW 0), costs a flat 256, plays
+        // action 95, and resets to blades (A()).
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        gp.magic = 500;
+        gp.player.weapon_mode = 3;
+        // Stand by the 448 enemy so it is in the
+        // viewport and gets targeted; tick first
+        // so the camera catches up to the teleport.
+        gp.player.ga = 416;
+        for _ in 0..20 {
+            t(&mut gp, &mut res, 0, false);
+        }
+        t(&mut gp, &mut res, 0, true);
+        assert_eq!(gp.player.action, 95, "mode 3 should play action 95");
+        assert_eq!(gp.player.weapon_mode, 0, "cast resets to blades");
+        assert_eq!(gp.magic, 244, "flat 256 cost (500 - 256)");
+        assert_eq!(gp.pickups.damage_orb_count(), 9, "128 -> 9 orbs");
+        // The orbs home on the 448 enemy and deal
+        // their total 128 damage (13 hp -> dead).
+        let health = |gp: &super::Gameplay| {
+            gp.enemy_states
+                .iter()
+                .find(|st| st.enemy.x == 448)
+                .map(|st| st.health)
+                .unwrap()
+        };
+        let start = health(&gp);
+        for _ in 0..400 {
+            t(&mut gp, &mut res, 0, false);
+            if gp.pickups.damage_orb_count() == 0 {
+                break;
+            }
+        }
+        assert_eq!(gp.pickups.damage_orb_count(), 0, "orbs never landed");
+        assert!(health(&gp) < start, "damage orbs dealt no damage");
+    }
+
+    #[test]
+    fn mode3_gate_blocks_low_magic_and_full_orbs() {
+        // Gate: magic <= 256, or 10+ active damage
+        // orbs, falls back to a blades swing and
+        // resets to blades (the original's s(54)).
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        gp.magic = 256;
+        gp.player.weapon_mode = 3;
+        t(&mut gp, &mut res, 0, true);
+        assert_eq!(gp.player.weapon_mode, 0, "failed gate resets to blades");
+        assert_eq!(gp.player.action, 54, "failed gate falls to a swing");
+        assert_eq!(gp.pickups.damage_orb_count(), 0);
+        assert_eq!(gp.magic, 256, "no cost on a failed gate");
+    }
+
+    #[test]
+    fn mode2_cast_channels_and_drains() {
+        // Mode 2 (hc, Phase 3): fire with magic >
+        // (gV+1)*4 starts action 94; each tick
+        // with attack pressed drains 12; a tick
+        // without attack ends the cast (idle +
+        // blades). The hit itself applies no
+        // damage (dX stagger is Phase 6).
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        gp.magic = 100;
+        gp.player.weapon_mode = 2;
+        // Away from spawn (a spawn script `^` step
+        // would otherwise reset the weapon mode).
+        gp.player.ga = 416;
+        t(&mut gp, &mut res, 0, true);
+        assert_eq!(gp.player.action, 94, "mode 2 should play action 94");
+        assert_eq!(gp.magic, 88, "12 drained on the fire tick");
+        assert_eq!(gp.player.weapon_mode, 2, "channel keeps the mode");
+        t(&mut gp, &mut res, 0, true);
+        assert_eq!(gp.magic, 76, "12 drained per channel tick");
+        assert_eq!(gp.player.action, 94, "still channeling");
+        // Release attack: the cast ends.
+        t(&mut gp, &mut res, 0, false);
+        assert_eq!(gp.player.action, 0, "cast ends on release");
+        assert_eq!(gp.player.weapon_mode, 0, "cast end resets to blades");
+        assert_eq!(gp.magic, 76, "no drain after the cast ends");
+    }
+
+    #[test]
+    fn mode2_cast_ends_when_magic_runs_out() {
+        // Channel until magic hits 0: the cast
+        // ends (idle + blades) instead of going
+        // negative.
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        gp.magic = 30;
+        gp.player.weapon_mode = 2;
+        // Away from spawn (a spawn script `^` step
+        // would otherwise reset the weapon mode).
+        gp.player.ga = 416;
+        t(&mut gp, &mut res, 0, true);
+        assert_eq!(gp.player.action, 94);
+        assert_eq!(gp.magic, 18);
+        t(&mut gp, &mut res, 0, true);
+        assert_eq!(gp.magic, 6);
+        assert_eq!(gp.player.action, 94);
+        t(&mut gp, &mut res, 0, true);
+        assert_eq!(gp.magic, 0, "drain clamps at 0");
+        // The cast ends on the tick after magic
+        // reaches 0 (the drain tick itself still
+        // channels).
+        t(&mut gp, &mut res, 0, true);
+        assert_eq!(gp.player.action, 0, "cast ends at 0 magic");
+        assert_eq!(gp.player.weapon_mode, 0);
     }
 
     #[test]

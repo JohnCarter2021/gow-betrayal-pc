@@ -501,6 +501,7 @@ fn main() {
         let mut script_engine = script::ScriptEngine::new(script_triggers, script_strings);
         let mut play_completed = false;
         for key in &keys {
+            let mut attack_pressed = false;
             match key.as_str() {
                 "left" => held = -1,
                 "right" => held = 1,
@@ -538,6 +539,7 @@ fn main() {
                     }
                 }
                 "attack" => {
+                    attack_pressed = true;
                     // No attack while blocking (slice 18).
                     if pl.blocking {
                         println!("blocked stance, attack ignored");
@@ -548,6 +550,80 @@ fn main() {
                     if pl.is_artemis() && magic <= 0 {
                         pl.unequip_all();
                         println!("magic spent, back to blades");
+                        continue;
+                    }
+                    // Phase 3: magic modes.
+                    if pl.is_magic_mode3() {
+                        if magic > player::Player::MODE3_COST
+                            && pickups.damage_orb_count() < 10
+                        {
+                            // Fire: action 95, spawn
+                            // type-3 orbs, 256 cost,
+                            // reset to blades (A()).
+                            if let Ok(anim_chunk) = res.chunk(28672) {
+                                if let Ok(anim_set) =
+                                    anim::load_anim_set(&anim_chunk)
+                                {
+                                    pl.attack(&anim_set);
+                                }
+                            }
+                            let g_w = pl.magic_level_mode3.clamp(0, 4) as usize;
+                            let value = player::Player::F_L[g_w];
+                            let targets: Vec<usize> = enemy_states
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, st)| {
+                                    !st.dead
+                                        && st.x >= pl.cam_x - 64
+                                        && st.x < pl.cam_x + 240 + 64
+                                        && st.y >= pl.cam_y - 64
+                                        && st.y < pl.cam_y + 320 + 64
+                                })
+                                .map(|(i, _)| i)
+                                .collect();
+                            pickups.spawn(
+                                pl.ga,
+                                pl.gb - 34 + 8,
+                                pickups::DAMAGE,
+                                value,
+                                &mut orb_rng,
+                            );
+                            pickups.assign_damage_targets(&targets);
+                            magic = (magic - player::Player::MODE3_COST).max(0);
+                            pl.unequip_all();
+                            println!(
+                                "mode 3 cast: action 95, {} damage orbs (value {}), magic {}",
+                                pickups.damage_orb_count(),
+                                value,
+                                magic
+                            );
+                        } else {
+                            // Gate failed: blades + swing.
+                            pl.unequip_all();
+                            if let Ok(anim_chunk) = res.chunk(28672) {
+                                if let Ok(anim_set) =
+                                    anim::load_anim_set(&anim_chunk)
+                                {
+                                    pl.attack(&anim_set);
+                                }
+                            }
+                            println!("mode 3 gate failed, back to blades");
+                        }
+                        continue;
+                    }
+                    if pl.is_magic_mode2() {
+                        if magic > pl.mode2_start_gate() {
+                            if let Ok(anim_chunk) = res.chunk(28672) {
+                                if let Ok(anim_set) =
+                                    anim::load_anim_set(&anim_chunk)
+                                {
+                                    pl.attack(&anim_set);
+                                    println!("mode 2 cast: action 94 (channel)");
+                                }
+                            }
+                        } else {
+                            println!("mode 2 gate failed (magic {})", magic);
+                        }
                         continue;
                     }
                     if let Ok(anim_chunk) = res.chunk(28672) {
@@ -801,6 +877,34 @@ fn main() {
                         .iter()
                         .map(|st| (st.x, st.y, !st.dead))
                         .collect();
+                    // Mode-2 channel (Phase 3): while in
+                    // action 94, drain 12 magic per tick
+                    // while attack is pressed; end the
+                    // cast when attack is released or
+                    // magic runs out.
+                    if pl.action == 94 {
+                        if attack_pressed && magic > 0 {
+                            magic = (magic
+                                - player::Player::MODE2_DRAIN_PER_TICK)
+                                .max(0);
+                        } else {
+                            if let Ok(anim_chunk) = res.chunk(28672) {
+                                if let Ok(anim_set) =
+                                    anim::load_anim_set(&anim_chunk)
+                                {
+                                    pl.end_magic_cast(&anim_set);
+                                    println!(
+                                        "mode 2 cast ended ({})",
+                                        if magic <= 0 {
+                                            "magic spent"
+                                        } else {
+                                            "attack released"
+                                        }
+                                    );
+                                }
+                            }
+                        }
+                    }
                     for ev in pickups.update((pl.ga, pl.gb), &enemy_pos) {
                         match ev {
                             pickups::PickupEvent::Collected { kind, value } => match kind {
@@ -811,9 +915,48 @@ fn main() {
                                 pickups::MAGIC => magic = (magic + value).min(1024),
                                 _ => {}
                             },
-                            pickups::PickupEvent::HitEnemy { .. } => {
-                                // No damage orbs exist in --play yet
-                                // (they only spawn from magic weapons).
+                            pickups::PickupEvent::HitEnemy { index, value } => {
+                                // Phase 3: a damage orb hit
+                                // its target enemy.
+                                if let Some(st) = enemy_states.get_mut(index) {
+                                    if st.dead || st.dying {
+                                        continue;
+                                    }
+                                    let killed =
+                                        if let Ok(anim_chunk) =
+                                            res.chunk(st.enemy.anim_id)
+                                        {
+                                            if let Ok(anim_set) =
+                                                anim::load_anim_set(&anim_chunk)
+                                            {
+                                                st.apply_damage(&anim_set, value)
+                                            } else {
+                                                false
+                                            }
+                                        } else {
+                                            false
+                                        };
+                                    println!(
+                                        "damage orb hits enemy {} for {} (health {}){}",
+                                        st.enemy.index,
+                                        value,
+                                        st.health,
+                                        if killed { " - DIED" } else { "" }
+                                    );
+                                    if killed {
+                                        let drop_kind = match st.enemy.kind {
+                                            12 => pickups::MAGIC,
+                                            _ => pickups::GOLD,
+                                        };
+                                        pickups.spawn(
+                                            st.x,
+                                            st.y - 16,
+                                            drop_kind,
+                                            st.enemy.em,
+                                            &mut orb_rng,
+                                        );
+                                    }
+                                }
                             }
                         }
                     }

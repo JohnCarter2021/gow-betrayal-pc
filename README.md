@@ -2,11 +2,11 @@
 
 A Rust PC port, in progress, of *God of War: Betrayal* (J2ME, Glu Mobile, v1.4.8).
 
-Status, 2026-11-05 — v0.6.0: everything in v0.5.0, plus Phase 1
-(movement & world: double jump, full tile flags, climb, box grab/push,
-ledge mount, camera zones, one-way drop-through, switches/doors/levers)
-and Phase 2 (boss bars: the `@` trigger latch + slot-131 bar drawn at
-screen (12, 295) — a looping 2-frame animation, not a health bar):
+Status, 2026-11-05 — v0.7.0: everything in v0.6.0, plus Phase 3
+(magic: mode 3 fires action 95 and spawns type-3 damage orbs
+totalling `fL[gW]` for a flat 256 magic, then resets to blades;
+mode 2 fires action 94, a channeled cast draining 12 magic per
+tick while attack is pressed):
 
 - **MIDP shim, std-only, no crates:** 240×320 framebuffer, `Graphics`
   (clip / translate / `drawRegion` with all 8 MIDP transforms), sprite

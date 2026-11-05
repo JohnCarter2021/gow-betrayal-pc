@@ -550,13 +550,16 @@ impl Game {
             // (script strings and the intro dialog).
             // Combo caps/shifts come from the save
             // (slice 16: gN/gP; slice 17: gO/gQ for
-            // Artemis).
+            // Artemis). Magic levels too (Phase 3:
+            // gV for mode 2, gW for mode 3).
             if let Some(gp) = &mut self.gameplay {
                 gp.set_strings(self.strings.clone());
                 gp.player.combo_max = self.save.g_n;
                 gp.player.combo_shift = self.save.g_p;
                 gp.player.combo_max_artemis = self.save.g_o;
                 gp.player.combo_shift_artemis = self.save.g_q;
+                gp.player.magic_level_mode2 = self.save.g_v;
+                gp.player.magic_level_mode3 = self.save.g_w;
             }
         }
     }

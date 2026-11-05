@@ -335,9 +335,15 @@ pub struct Player {
     pub combo_shift: i32,
     /// Weapon mode `fM` (slice 17): 0 normal
     /// blades, 1 Blade of Artemis (`hb`), 2/3
-    /// magic modes (`hc`/`hd`, casts not ported:
-    /// fire does nothing in those modes).
+    /// magic modes (`hc`/`hd`, Phase 3 casts).
     pub weapon_mode: i32,
+    /// Magic upgrade levels (Phase 3, save fields
+    /// `gV`/`gW`, 0-4; fresh-save default 0; Game
+    /// overwrites from the save): gV indexes the
+    /// mode-2 stagger table `fK`, gW indexes the
+    /// mode-3 damage-orb table `fL`.
+    pub magic_level_mode2: i32,
+    pub magic_level_mode3: i32,
     /// Blocking `hw` (slice 18): true while Down
     /// is held and the block stance holds.
     pub blocking: bool,
@@ -400,6 +406,8 @@ impl Player {
             combo_max: 3,
             combo_shift: 0,
             weapon_mode: 0,
+            magic_level_mode2: 0,
+            magic_level_mode3: 0,
             blocking: false,
             combo_max_artemis: 2,
             combo_shift_artemis: 0,
@@ -447,6 +455,67 @@ impl Player {
     /// (`hb`, slice 17).
     pub fn is_artemis(&self) -> bool {
         self.weapon_mode == 1
+    }
+
+    /// Magic mode 2 (`hc`, Phase 3): channeled
+    /// stagger magic, action 94.
+    pub fn is_magic_mode2(&self) -> bool {
+        self.weapon_mode == 2
+    }
+
+    /// Magic mode 3 (`hd`, Phase 3): burst damage
+    /// orbs, action 95.
+    pub fn is_magic_mode3(&self) -> bool {
+        self.weapon_mode == 3
+    }
+
+    /// Mode-2 stagger table `fK` (e.java:591),
+    /// indexed by `gV` (magic_level_mode2, 0-4).
+    /// A mode-2 hit adds `(fK[gV] << 5) + L` to
+    /// the enemy's `dX` stagger timer (Phase 6;
+    /// dX itself is not ported yet).
+    pub const F_K: [i32; 5] = [2, 3, 4, 5, 6];
+
+    /// Mode-3 damage-orb value table `fL`
+    /// (e.java:592), indexed by `gW`
+    /// (magic_level_mode3, 0-4). The cast spawns
+    /// type-3 orbs totalling this value.
+    pub const F_L: [i32; 5] = [128, 256, 512, 1024, 1536];
+
+    /// Mode-3 cast cost (e.java:3712): one flat
+    /// 256 magic per `b()` call, not per orb.
+    pub const MODE3_COST: i32 = 256;
+
+    /// Mode-2 channel drain (e.java:5190): 12
+    /// magic per tick while action 94 is held.
+    pub const MODE2_DRAIN_PER_TICK: i32 = 12;
+
+    /// Mode-2 start gate (e.java:5029): magic
+    /// must exceed `(gV + 1) << 2`.
+    pub fn mode2_start_gate(&self) -> i32 {
+        (self.magic_level_mode2 + 1) << 2
+    }
+
+    /// Start the mode-2 channeled cast (action 94,
+    /// 16 frames, repeat 63 = loops while held).
+    pub fn start_magic_cast_94(&mut self, anim: &AnimSet) {
+        self.action = 94;
+        self.slot = AnimSlot::new(anim, 94);
+    }
+
+    /// Start the mode-3 burst cast (action 95,
+    /// 17 frames, repeat 1 = plays once).
+    pub fn start_magic_cast_95(&mut self, anim: &AnimSet) {
+        self.action = 95;
+        self.slot = AnimSlot::new(anim, 95);
+    }
+
+    /// End a magic cast: back to idle and reset
+    /// the weapon to blades (`A()`: fM = 0).
+    pub fn end_magic_cast(&mut self, anim: &AnimSet) {
+        self.action = 0;
+        self.slot = AnimSlot::new(anim, 0);
+        self.unequip_all();
     }
 
     /// Ground damage table `fI` (slice 16), indexed
@@ -903,10 +972,22 @@ impl Player {
             return false;
         }
         if self.weapon_mode == 2 || self.weapon_mode == 3 {
-            // Magic modes: casts are not ported yet,
-            // so fire does nothing (rather than a
-            // wrong blades swing).
-            return false;
+            // Magic modes (Phase 3): start the cast
+            // action; the caller (Gameplay / --play)
+            // applies the costs and spawns the orbs.
+            // Mode 2 (hc): action 94, channeled
+            // (loops while attack is pressed, drains
+            // 12 magic/tick). Mode 3 (hd): action 95,
+            // one-shot burst (spawns damage orbs).
+            if self.action == 94 || self.action == 95 {
+                return false;
+            }
+            if self.weapon_mode == 2 {
+                self.start_magic_cast_94(anim);
+            } else {
+                self.start_magic_cast_95(anim);
+            }
+            return true;
         }
         if self.action == 0 || self.action == 9 {
             self.start_ground_swing(anim);
@@ -1031,6 +1112,34 @@ impl Player {
                 self.action = 0;
                 self.slot = AnimSlot::new(anim, 0);
             }
+            let target_x = self.ga - 120 + if self.facing_right { 60 } else { -60 };
+            let target_y = self.gb - 266;
+            self.update_camera(target_x, target_y, level_w, level_h);
+            return 0;
+        }
+        if self.action == 95 {
+            // Mode-3 burst cast (Phase 3): a one-shot
+            // 17-frame animation (repeat 1). The
+            // orbs were spawned and the weapon reset
+            // to blades at fire time; when the
+            // animation finishes, return to idle.
+            self.slot.advance(anim, 40);
+            if self.slot.repeat == 0 {
+                self.action = 0;
+                self.slot = AnimSlot::new(anim, 0);
+            }
+            let target_x = self.ga - 120 + if self.facing_right { 60 } else { -60 };
+            let target_y = self.gb - 266;
+            self.update_camera(target_x, target_y, level_w, level_h);
+            return 0;
+        }
+        if self.action == 94 {
+            // Mode-2 channeled cast (Phase 3): a
+            // looping 16-frame animation (repeat 63).
+            // It plays until the caller ends it (attack
+            // released or magic spent); the drain is
+            // the caller's job (Gameplay, 12/tick).
+            self.slot.advance(anim, 40);
             let target_x = self.ga - 120 + if self.facing_right { 60 } else { -60 };
             let target_y = self.gb - 266;
             self.update_camera(target_x, target_y, level_w, level_h);

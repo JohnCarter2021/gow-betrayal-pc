@@ -417,7 +417,8 @@ down, down, Select, Select, and draws the result to
   pillar door before the level-end trigger). The level-1 wall
   crossing and the temple-floor run to the level end are both
   verified by Gameplay tests. `cargo test`: 100/100. Windows
-  cross-build OK (2,468,657 bytes). Not yet pushed/released.
+  cross-build OK (2,468,657 bytes). Shipped in v0.6.0
+  (2026-11-05, commit 26766b77).
 
 - Phase 2 DONE (2026-11-05): boss research, then boss bars
   (slot 131). The bar is a looping 2-frame animation (anim set
@@ -427,17 +428,28 @@ down, down, Select, Select, and draws the result to
   player leaves the trigger tiles. fR/fS/fQ are the grapple
   mini-game (not ported), not boss-bar fields. `cargo test`:
   103/103. Windows cross-build OK (2,474,209 bytes). v0.6.0
-  (Phases 1+2) ready, awaiting the user's go-ahead to push +
-  release.
+  (Phases 1+2) shipped 2026-11-05 ~14:18 IST (commit 26766b77,
+  release tag v0.6.0, marked Latest).
+
+- Phase 3 DONE (2026-11-05): magic. Mode 3 (`hd`) fires action
+  95 and spawns type-3 damage orbs totalling `fL[gW]`
+  (128 at gW 0) from above the player's feet, for a flat 256
+  magic, then resets to blades; a failed gate (magic <= 256
+  or 10+ active orbs) falls back to a blades swing. Mode 2
+  (`hc`) fires action 94, a channeled cast draining 12 magic
+  per tick while attack is pressed, ending on release or at 0
+  magic; its hit effect (dX stagger, `fK[gV]`) is deferred
+  to Phase 6 (dX not ported). Magic does not regenerate yet
+  (original: `hl += hn/64`/tick) — it comes only from MAGIC
+  orbs. `cargo test`: 109/109. Windows cross-build OK
+  (2,482,068 bytes). Cargo version 0.7.0.
 
 ## Next steps (see ../REPORT.md)
-1. Phase 3: magic (modes 2/3 fire, costs, type-3 damage orbs).
-2. Phase 3: magic (modes 2/3 fire, costs, type-3 damage orbs).
-3. Phase 4: enemy AI depth + real '!' cutscene playback.
-4. Phase 5: menus & meta (in-game menu, settings, Arena waves,
+1. Phase 4: enemy AI depth + real '!' cutscene playback.
+2. Phase 5: menus & meta (in-game menu, settings, Arena waves,
    level-placed collectibles, state-109 interstitial, lever pull
    animations, type-28 rectangle door triggers).
-5. Phase 6: combat polish (hurt reactions, block poses 27/28,
+3. Phase 6: combat polish (hurt reactions, block poses 27/28,
    fire-while-grabbing release, HUD weapon icon per mode).
 6. Phase 7: presentation, loose ends & v1.0.
 

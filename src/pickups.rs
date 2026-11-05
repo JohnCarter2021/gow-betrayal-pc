@@ -115,6 +115,32 @@ pub struct Pickups {
 }
 
 impl Pickups {
+    /// Assign targets to untargeted DAMAGE orbs
+    /// (Phase 3, magic mode 3): the original's
+    /// `b()` round-robins the type-3 orbs over the
+    /// enemies in the viewport (`P[]`), so each
+    /// orb homes on a different enemy. `targets`
+    /// are enemy state indices in viewport order.
+    /// Does nothing when the list is empty.
+    pub fn assign_damage_targets(&mut self, targets: &[usize]) {
+        if targets.is_empty() {
+            return;
+        }
+        let mut next = 0;
+        for orb in &mut self.orbs {
+            if orb.kind == DAMAGE && orb.target.is_none() {
+                orb.target = Some(targets[next % targets.len()]);
+                next += 1;
+            }
+        }
+    }
+
+    /// Count live DAMAGE orbs (the mode-3 gate
+    /// `fG < 10` counts active projectiles).
+    pub fn damage_orb_count(&self) -> usize {
+        self.orbs.iter().filter(|o| o.kind == DAMAGE).count()
+    }
+
     /// Spawn orbs for `b(x, y, kind, value)`. Death
     /// sites call this with the enemy's `em` value.
     pub fn spawn(&mut self, x: i32, y: i32, kind: i32, value: i32, rng: &mut OrbRng) {
@@ -355,6 +381,56 @@ mod tests {
         let events = p.update((200, 100), &[]);
         assert!(events.is_empty(), "fresh orbs collected too early");
         assert_eq!(p.orbs.len(), 4);
+    }
+
+    #[test]
+    fn damage_orbs_target_enemies_round_robin() {
+        let mut p = Pickups::default();
+        let mut rng = OrbRng(1);
+        // Mode-3 value 128 -> orbs 18,18,18,18,18,18,9,9,2
+        // (9 orbs). Spawn with no targets, then assign.
+        p.spawn(200, 100, DAMAGE, 128, &mut rng);
+        assert_eq!(p.orbs.len(), 9);
+        assert_eq!(p.damage_orb_count(), 9);
+        assert!(p.orbs.iter().all(|o| o.target.is_none()));
+        p.assign_damage_targets(&[0, 1]);
+        let targets: Vec<usize> = p
+            .orbs
+            .iter()
+            .map(|o| o.target.expect("target assigned"))
+            .collect();
+        assert_eq!(targets, vec![0, 1, 0, 1, 0, 1, 0, 1, 0]);
+        // Assigning again does not re-target orbs that
+        // already have one.
+        p.assign_damage_targets(&[5]);
+        assert_eq!(p.orbs[0].target, Some(0));
+    }
+
+    #[test]
+    fn damage_orb_hits_enemy_not_player() {
+        let mut p = Pickups::default();
+        let mut rng = OrbRng(1);
+        // Value 18 -> six orbs of 3 plus the
+        // faithful trailing zero-value orb.
+        p.spawn(200, 100, DAMAGE, 18, &mut rng);
+        assert_eq!(p.orbs.len(), 7);
+        p.assign_damage_targets(&[3]);
+        // Enemy at (200, 100), player far away.
+        let enemies = vec![(200, 100, true)];
+        let mut hit = 0;
+        for _ in 0..600 {
+            for ev in p.update((0, 0), &enemies) {
+                if let PickupEvent::HitEnemy { index, value } = ev {
+                    assert_eq!(index, 3);
+                    hit += value;
+                }
+            }
+            if p.orbs.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(hit, 18, "damage orb never reached its enemy");
+        assert!(p.orbs.is_empty());
     }
 }
 
