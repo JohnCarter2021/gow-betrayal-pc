@@ -479,17 +479,38 @@ down, down, Select, Select, and draws the result to
   kill count increments on every enemy death); state-109
   level-complete interstitial (Select continues with
   save, Exit goes to the menu). `cargo test`: 128/128.
-  Windows cross-build OK (2,502,355 bytes). Not yet
-  released — awaiting a go-ahead to ship (v1.0.0 per
-  the plan). Gaps: Arena wave respawn untraced, best
-  score / "You Are Dead" screen not ported (no death
-  screen yet).
-
+  Windows cross-build OK (2,502,842 bytes). Shipped
+  as v1.0.0 (2026-11-05 ~17:26 IST, push commit
+  22d27c95, browser-verified, marked Latest). Gaps:
+  Arena wave respawn untraced, best score / "You Are
+  Dead" screen not ported (no death screen yet).
+- Phase 6 COMPLETE (2026-11-05): combat polish —
+  hurt reactions (5/7/100, damage > 50 turns to face
+  the attacker and plays 7), block poses (27 enter,
+  3 hold, 28 exit; Up while blocking exits to idle
+  with no jump), death/stagger root-motion slide
+  (raw dx with the facing sign; enemy 2: -26, 7: -15,
+  8: -32, 9: -18; player 5/7: -32, 100: +46), heavy
+  stagger variants (kind 11 -> 7, kind 12 -> 9,
+  kind 13 -> 8), dX cooldown + slot-137 stagger
+  indicator (mode-2 hits add (fK[gV] << 5) + 40;
+  decay 40 + max_health/64 per tick; swings gated
+  at dX > 500; weakened marker requires dX <= 0),
+  HUD weapon icon per mode (frame 5 + fM), fire-
+  while-grabbing release (attack from 21 -> idle).
+  `cargo test`: 136/136. Windows cross-build OK
+  (2,507,732 bytes). Not yet shipped — awaiting a
+  go-ahead to ship (v1.1.0 per the plan). Deviation:
+  walking out of block on a Left/Right press is NOT
+  ported (port uses held dir, not press edges).
 ## Next steps (see ../REPORT.md)
-1. Ship Phase 5 complete (v1.0.0 per the plan) — awaiting go-ahead.
-2. Phase 6: combat polish (hurt reactions, block poses 27/28,
-   fire-while-grabbing release, HUD weapon icon per mode).
-6. Phase 7: presentation, loose ends & v1.0.
+1. Ship Phase 6 (v1.1.0 per the plan) — awaiting go-ahead.
+2. Phase 7: death, Arena completion & the full playthrough
+   (player death + "You Are Dead" screen, Arena best
+   score, checkpoint respawn, Arena wave respawn,
+   state-104 upgrade interstitial, magic regeneration,
+   full playthrough verification).
+3. Phase 8: grapple, presentation & loose ends.
 
 The original jar is loaded from the user's own copy at runtime; no Glu
 assets are redistributed in this repo.

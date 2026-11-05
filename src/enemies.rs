@@ -260,16 +260,16 @@ mod tests {
         let anim = crate::anim::load_anim_set(&anim_pack.chunk(0).unwrap()).unwrap();
         let mut rng = crate::pickups::OrbRng(1);
         let mut st = super::EnemyState::new(enemy, &anim);
-        assert!(!st.apply_damage(&anim, 2));
+        assert!(!st.apply_damage(&anim, 2, false));
         assert_eq!(st.health, 1);
-        assert!(st.apply_damage(&anim, 2));
+        assert!(st.apply_damage(&anim, 2, false));
         // Killing blow starts the death animation (kind 11
         // -> action 8, ~1.6 s), not instant removal.
         assert!(st.dying);
         assert!(!st.dead);
         assert_eq!(st.action, 8);
         // Further hits are ignored while dying.
-        assert!(!st.apply_damage(&anim, 2));
+        assert!(!st.apply_damage(&anim, 2, false));
         // Advance until the animation finishes.
         let flags = flags_9217(&parsed);
         for _ in 0..100 {
@@ -296,7 +296,7 @@ mod tests {
         let anim = crate::anim::load_anim_set(&anim_pack.chunk(0).unwrap()).unwrap();
         let mut rng = crate::pickups::OrbRng(1);
         let mut st = super::EnemyState::new(enemy, &anim);
-        assert!(!st.apply_damage(&anim, 2));
+        assert!(!st.apply_damage(&anim, 2, false));
         assert_eq!(st.health, 11);
         assert!(!st.dead && !st.dying);
         assert_eq!(st.action, 2, "kind 11 staggers with action 2");
@@ -319,18 +319,105 @@ mod tests {
     }
 
     #[test]
+    fn heavy_stagger_variants_and_slide() {
+        // Phase 6: a finisher (heavy) selects the
+        // heavy stagger variants — kind 11 -> 7,
+        // kind 12 -> 9, kind 13 -> 8 — and the
+        // stagger slides the enemy backward (set
+        // 18432 action 2 totals dx -26).
+        let data = std::fs::read("../extracted/RP9").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        let chunk = pack.chunk(1).unwrap();
+        let parsed = crate::entities::parse_level_entities(9217, &chunk).unwrap();
+        let list = super::enemies(&parsed);
+        let anim_data = std::fs::read("../extracted/RP18").unwrap();
+        let anim_pack = crate::rp::parse_pack(&anim_data).unwrap();
+        let anim = crate::anim::load_anim_set(&anim_pack.chunk(0).unwrap()).unwrap();
+        let mut rng = crate::pickups::OrbRng(1);
+        let flags = flags_9217(&parsed);
+        // Kind 11 (x=448): normal -> 2, heavy -> 7.
+        let enemy = list.iter().find(|e| e.x == 448).unwrap().clone();
+        assert_eq!(enemy.kind, 11);
+        let mut st = super::EnemyState::new(enemy, &anim);
+        assert!(!st.apply_damage(&anim, 2, false));
+        assert_eq!(st.action, 2);
+        let mut st = super::EnemyState::new(
+            list.iter().find(|e| e.x == 448).unwrap().clone(),
+            &anim,
+        );
+        assert!(!st.apply_damage(&anim, 2, true));
+        assert_eq!(st.action, 7, "kind 11 heavy stagger is 7");
+        // The stagger slides the enemy backward
+        // (away from its facing): x moves.
+        let x0 = st.x;
+        for _ in 0..30 {
+            st.tick(&anim, &flags, 458, 560, &mut rng);
+            if st.action == 0 {
+                break;
+            }
+        }
+        assert_eq!(st.action, 0, "heavy stagger never finished");
+        assert_ne!(st.x, x0, "stagger should slide the enemy");
+        // Kind 13 (x=1408): normal -> 4, heavy -> 8.
+        let enemy13 = list.iter().find(|e| e.x == 1408).unwrap().clone();
+        assert_eq!(enemy13.kind, 13);
+        let mut st13 = super::EnemyState::new(enemy13, &anim);
+        assert!(!st13.apply_damage(&anim, 2, false));
+        assert_eq!(st13.action, 4);
+        let mut st13 = super::EnemyState::new(
+            list.iter().find(|e| e.x == 1408).unwrap().clone(),
+            &anim,
+        );
+        assert!(!st13.apply_damage(&anim, 2, true));
+        assert_eq!(st13.action, 8, "kind 13 heavy stagger is 8");
+    }
+
+    #[test]
+    fn dx_decays_per_tick() {
+        // Phase 6: dX decays by `40 + max_health/64`
+        // per tick while positive (e.java:6627-6630).
+        // The 448 enemy has max health 13, so the
+        // decay is 40 per tick.
+        let data = std::fs::read("../extracted/RP9").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        let chunk = pack.chunk(1).unwrap();
+        let parsed = crate::entities::parse_level_entities(9217, &chunk).unwrap();
+        let list = super::enemies(&parsed);
+        let anim_data = std::fs::read("../extracted/RP18").unwrap();
+        let anim_pack = crate::rp::parse_pack(&anim_data).unwrap();
+        let anim = crate::anim::load_anim_set(&anim_pack.chunk(0).unwrap()).unwrap();
+        let mut rng = crate::pickups::OrbRng(1);
+        let flags = flags_9217(&parsed);
+        let enemy = list.iter().find(|e| e.x == 448).unwrap().clone();
+        let mut st = super::EnemyState::new(enemy, &anim);
+        assert_eq!(st.max_health, 13);
+        st.dx = 100;
+        st.tick(&anim, &flags, 9000, 560, &mut rng);
+        assert_eq!(st.dx, 60);
+        st.tick(&anim, &flags, 9000, 560, &mut rng);
+        assert_eq!(st.dx, 20);
+        st.tick(&anim, &flags, 9000, 560, &mut rng);
+        assert!(st.dx <= 0, "dX should reach 0, got {}", st.dx);
+    }
+
+    #[test]
     fn weakened_marker_rule() {
         use super::weakened_marker_visible as vis;
         // Full health: no marker. At exactly half:
         // no marker (ek < en>>1 is strict).
-        assert!(!vis(13, 13, false, false));
-        assert!(!vis(6, 13, false, false));
+        assert!(!vis(13, 13, false, false, 0));
+        assert!(!vis(6, 13, false, false, 0));
         // Below half: marker. Dead/dying: none, even
         // with low health. Negative health: none.
-        assert!(vis(5, 13, false, false));
-        assert!(!vis(5, 13, true, false));
-        assert!(!vis(5, 13, false, true));
-        assert!(!vis(-1, 13, false, false));
+        assert!(vis(5, 13, false, false, 0));
+        assert!(!vis(5, 13, true, false, 0));
+        assert!(!vis(5, 13, false, true, 0));
+        assert!(!vis(-1, 13, false, false, 0));
+        // Staggered (dX > 0): no weakened marker
+        // (Phase 6, e.java:2571 — the slot-137
+        // indicator shows instead).
+        assert!(!vis(5, 13, false, false, 100));
+        assert!(vis(5, 13, false, false, -40));
     }
 
     #[test]
@@ -398,6 +485,17 @@ pub struct EnemyState {
     /// Starts 0 at spawn (so the first walk comes
     /// after a single idle tick).
     pub eu: i32,
+    /// Stagger cooldown `dX` (Phase 6, e.java:282):
+    /// a mode-2 (hc) hit adds `(fK[gV] << 5) + 40`;
+    /// it decays by `40 + max_health/64` per tick
+    /// (e.java:6627-6630) and is NOT clamped at 0
+    /// (the original lets it go negative by one
+    /// tick's decrement). While `dX > 0` the enemy
+    /// shows the slot-137 indicator; while
+    /// `dX > 500` melee hits do not apply
+    /// (e.java:5863/5880); the weakened marker
+    /// needs `dX <= 0` (e.java:2571).
+    pub dx: i32,
     /// The enemy's anim set (cloned at load, Phase 4):
     /// lets the cutscene set the enemy's action to
     /// an aZ-table entry without a Resources lookup.
@@ -424,6 +522,7 @@ impl EnemyState {
             attack_count: 0,
             el,
             eu: 0,
+            dx: 0,
             anim_set: None,
             enemy,
         }
@@ -446,16 +545,44 @@ impl EnemyState {
     }
 
     /// Stagger (flinch) action from e.java's non-lethal
-    /// hit branch: kinds 11/12 -> action 2, kind 13 ->
-    /// action 4 (the no-target-lock, normal-weapon case;
-    /// locked-target variants 7/9/8/13 and the dX
-    /// cooldown gate are NOT ported — see REPORT).
+    /// hit branch (Phase 6): kinds 11/12 -> action 2,
+    /// kind 13 -> action 4 normally; the heavy
+    /// variants apply when the player is in a
+    /// finisher (hB == 60 blades / 77 Artemis,
+    /// e.java:6460-6475 — the `ge != -1` grapple
+    /// half of the condition is not ported, since
+    /// grapple is not ported): kind 11 -> 7,
+    /// kind 12 -> 9, kind 13 -> 8. The 13 variant
+    /// (kind 13 hit by player action 12) is NOT
+    /// ported — player action 12 is untraced.
     /// Measured on set 18432: action 2 = 10 frames,
     /// repeat 1, ~600 ms; action 4 = 2 frames, repeat 1,
-    /// ~200 ms.
-    pub fn stagger_action(&self) -> usize {
+    /// ~200 ms. Stagger root motion (set 18432):
+    /// action 2 totals dx -26, action 7 -15,
+    /// action 8 -32, action 9 -18 (backward).
+    pub fn stagger_action(&self, heavy: bool) -> usize {
         match self.enemy.kind {
-            13 => 4,
+            11 => {
+                if heavy {
+                    7
+                } else {
+                    2
+                }
+            }
+            12 => {
+                if heavy {
+                    9
+                } else {
+                    2
+                }
+            }
+            13 => {
+                if heavy {
+                    8
+                } else {
+                    4
+                }
+            }
             _ => 2,
         }
     }
@@ -470,7 +597,10 @@ impl EnemyState {
     /// ignored. Facing is left unchanged on stagger
     /// (documented approximation — the original sets
     /// `ej` from the player's relative position).
-    pub fn apply_damage(&mut self, anim_set: &anim::AnimSet, amount: i32) -> bool {
+    /// `heavy` is true when the player is in a finisher
+    /// (action 60/77) — selects the heavy stagger
+    /// variants (Phase 6).
+    pub fn apply_damage(&mut self, anim_set: &anim::AnimSet, amount: i32, heavy: bool) -> bool {
         if self.dead || self.dying {
             return false;
         }
@@ -481,7 +611,7 @@ impl EnemyState {
             self.slot = anim::AnimSlot::new(anim_set, self.action);
             return true;
         }
-        self.action = self.stagger_action();
+        self.action = self.stagger_action(heavy);
         self.slot = anim::AnimSlot::new(anim_set, self.action);
         false
     }
@@ -503,24 +633,39 @@ impl EnemyState {
         if self.dead {
             return 0;
         }
-        // Dying: play the death animation in place (its
-        // root-motion slide is not applied yet — see
-        // REPORT), then mark fully dead when it ends.
-        // No AI, no damage, no further hits.
+        // dX decay (Phase 6, e.java:6627-6630):
+        // `40 + max_health/64` per tick while
+        // positive; not clamped at 0 (the original
+        // lets it go negative by one tick).
+        if self.dx > 0 {
+            self.dx -= 40 + self.max_health / 64;
+        }
+        // Dying: play the death animation with its
+        // root-motion slide (Phase 6: the dx is
+        // authored backward — set 18432 action 7
+        // totals -15, action 8 -32 — so it is
+        // applied RAW with the facing sign, like
+        // the player's hurt slide), then mark fully
+        // dead when it ends. No AI, no damage, no
+        // further hits.
         if self.dying {
-            self.slot.advance(anim_set, 40);
+            let (dx, _dy) = self.slot.advance(anim_set, 40);
+            self.x += if self.facing_right { dx } else { -dx };
             if self.slot.repeat == 0 {
                 self.dying = false;
                 self.dead = true;
             }
             return 0;
         }
-        // Stagger in progress (actions 2/4 only ever come
-        // from apply_damage in this port): play it in
-        // place — no movement, no attack — then return
-        // to idle when it ends.
-        if self.action == 2 || self.action == 4 {
-            self.slot.advance(anim_set, 40);
+        // Stagger in progress (actions 2/4, and the
+        // heavy variants 7/8/9 from apply_damage in
+        // this port): play it with its root-motion
+        // slide (set 18432 action 2 totals dx -26,
+        // action 9 -18), then return to idle when
+        // it ends. No movement, no attack.
+        if matches!(self.action, 2 | 4 | 7 | 8 | 9) {
+            let (dx, _dy) = self.slot.advance(anim_set, 40);
+            self.x += if self.facing_right { dx } else { -dx };
             if self.slot.repeat == 0 {
                 self.action = 0;
                 self.slot = anim::AnimSlot::new(anim_set, 0);
@@ -663,17 +808,17 @@ pub fn enemy_bbox_height(
     }
 }
 
-/// Weakened-marker visibility (slice 14), from the
-/// `r(Graphics)` condition for slot 132, with the
-/// port's approximations: no targeting (`ge < 0`
-/// always — grapple/lock not ported), no stagger
-/// cooldown (`dX <= 0` always — dX not ported),
+/// Weakened-marker visibility (slice 14, Phase 6),
+/// from the `r(Graphics)` condition for slot 132,
+/// with the port's approximations: no targeting
+/// (`ge < 0` always — grapple/lock not ported),
 /// `!eh` always (eh not ported), and the dQ/dR
 /// boss exceptions skipped (dR/dM/dN not ported).
-/// What remains is the health rule itself:
-/// alive and below half max health.
-pub fn weakened_marker_visible(health: i32, max_health: i32, dead: bool, dying: bool) -> bool {
-    !dead && !dying && health >= 0 && health < max_health / 2
+/// What remains is the health rule plus the dX
+/// rule: alive, below half max health, and not
+/// staggered (`dX <= 0`, e.java:2571).
+pub fn weakened_marker_visible(health: i32, max_health: i32, dead: bool, dying: bool, dx: i32) -> bool {
+    !dead && !dying && health >= 0 && health < max_health / 2 && dx <= 0
 }
 
 /// Draw the weakened markers (slot 132, slice 14):
@@ -701,7 +846,7 @@ pub fn draw_weakened_markers(
         return;
     };
     for st in states {
-        if !weakened_marker_visible(st.health, st.max_health, st.dead, st.dying) {
+        if !weakened_marker_visible(st.health, st.max_health, st.dead, st.dying, st.dx) {
             continue;
         }
         let base_y = st.y - st.ef - (st.ef >> 2);
@@ -716,6 +861,47 @@ pub fn draw_weakened_markers(
                     base_y + fr.dy - cam_y,
                     fr.transform,
                 );
+            }
+        }
+    }
+}
+
+/// Draw the stagger indicator (Phase 6, e.java:2567-2570):
+/// while an enemy's `dX > 0`, slot 137 (anim set 7168
+/// action 31, sprite set 7169 `bH`) is drawn at the
+/// enemy's position `(dT, dU)`, transform 0. The slot
+/// is advanced 40 ms per staggered enemy per tick by
+/// the caller (the original's `b(137, L)` inside the
+/// per-enemy draw block), so it animates.
+pub fn draw_stagger_indicators(
+    g: &Graphics,
+    fb: &mut Framebuffer,
+    stagger_anim: &anim::AnimSet,
+    stagger_sprites: &crate::resources::SpriteSet,
+    stagger_visual: usize,
+    states: &[EnemyState],
+    cam_x: i32,
+    cam_y: i32,
+) {
+    for st in states {
+        if st.dead || st.dying || st.dx <= 0 {
+            continue;
+        }
+        if let Ok(frames) =
+            anim::frames_for_timeline_frame(stagger_anim, 31, stagger_visual, 0)
+        {
+            for fr in &frames {
+                if let Some(frame) = stagger_sprites.frame(fr.sprite_idx) {
+                    draw_sprite_frame(
+                        g,
+                        fb,
+                        &stagger_sprites.image,
+                        frame,
+                        st.x + fr.dx - cam_x,
+                        st.y + fr.dy - cam_y,
+                        fr.transform,
+                    );
+                }
             }
         }
     }

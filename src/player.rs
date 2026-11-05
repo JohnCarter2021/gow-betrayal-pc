@@ -1021,11 +1021,13 @@ impl Player {
         self.weapon_mode = 0;
     }
 
-    /// Start the block stance (slice 18): Down
-    /// pressed while grounded and idle/walking,
+    /// Start the block stance (slice 18, Phase 6):
+    /// Down pressed while grounded and idle/walking,
     /// as in the original's case 6 (`hw = true;
-    /// s(3)`). Returns false otherwise (attacking,
-    /// airborne, or already blocking).
+    /// s(27)` — the ENTER pose; the hold pose 3
+    /// follows when 27 ends while Down is still
+    /// held, e.java:5216). Returns false otherwise
+    /// (attacking, airborne, or already blocking).
     pub fn start_block(&mut self, anim: &AnimSet) -> bool {
         // Already posing: nothing to do. But
         // blocking + idle (a 97 reaction just
@@ -1037,20 +1039,47 @@ impl Player {
         if self.action != 0 && self.action != 9 {
             return false;
         }
-        self.action = 3;
-        self.slot = AnimSlot::new(anim, 3);
+        self.action = 27;
+        self.slot = AnimSlot::new(anim, 27);
         self.blocking = true;
         true
     }
 
-    /// End the block stance (slice 18): Down
-    /// released (`t != 6` -> `hw = false; s(0)`).
+    /// End the block stance (slice 18, Phase 6):
+    /// Down released (`t != 6` -> `hw = false`)
+    /// plays the EXIT pose 28 (e.java:5324:
+    /// `hA == 3 && !hw -> s(28)`); the tick
+    /// returns to idle when 28 ends.
     pub fn stop_block(&mut self, anim: &AnimSet) {
         if self.blocking {
-            self.action = 0;
-            self.slot = AnimSlot::new(anim, 0);
+            self.action = 28;
+            self.slot = AnimSlot::new(anim, 28);
             self.blocking = false;
         }
+    }
+
+    /// Hurt reaction (Phase 6, e.java:5378-5382):
+    /// the player took `damage` from an attacker
+    /// facing `attacker_facing_right` (the
+    /// original's `gf = !ej`, i.e. the direction
+    /// the player must face to look at the
+    /// attacker). Damage > 50 turns the player
+    /// to face the attacker and plays the big
+    /// hurt (7); facing the attacker already
+    /// plays the small hurt (5); facing away
+    /// plays the from-behind hurt (100). The
+    /// caller checks the guards (grounded, not
+    /// blocking, not in 27/28/29/60/77, alive).
+    pub fn hurt_reaction(&mut self, anim: &AnimSet, damage: i32, attacker_facing_right: bool) {
+        if damage > 50 {
+            self.facing_right = attacker_facing_right;
+            self.action = 7;
+        } else if self.facing_right == attacker_facing_right {
+            self.action = 5;
+        } else {
+            self.action = 100;
+        }
+        self.slot = AnimSlot::new(anim, self.action);
     }
 
     /// One 40 ms tick. `dir`: -1 left, 0 none, +1 right.
@@ -1087,15 +1116,55 @@ impl Player {
             self.update_camera(target_x, target_y, level_w, level_h);
             return applied;
         }
+        if self.action == 27 {
+            // Block ENTER pose (Phase 6, e.java:5216):
+            // a one-shot pose; when it ends, the
+            // hold pose 3 follows while Down is
+            // still held, else the exit pose 28.
+            self.slot.advance(anim, 40);
+            if self.slot.repeat == 0 {
+                if self.blocking {
+                    self.action = 3;
+                    self.slot = AnimSlot::new(anim, 3);
+                } else {
+                    self.action = 28;
+                    self.slot = AnimSlot::new(anim, 28);
+                }
+            }
+            let target_x = self.ga - 120 + if self.facing_right { 60 } else { -60 };
+            let target_y = self.gb - 266;
+            self.update_camera(target_x, target_y, level_w, level_h);
+            return 0;
+        }
+        if self.action == 28 {
+            // Block EXIT pose (Phase 6, e.java:5324):
+            // one-shot; returns to idle when it ends.
+            self.slot.advance(anim, 40);
+            if self.slot.repeat == 0 {
+                self.action = 0;
+                self.slot = AnimSlot::new(anim, 0);
+            }
+            let target_x = self.ga - 120 + if self.facing_right { 60 } else { -60 };
+            let target_y = self.gb - 266;
+            self.update_camera(target_x, target_y, level_w, level_h);
+            return 0;
+        }
         if self.action == 3 {
             // Block stance (slice 18): a single
             // 100 ms pose, re-started when it ends
             // so the stance holds while Down is held
             // (the original's `hw && hA == 3 -> s(3)`
-            // re-affirmation). No walk, no root motion.
+            // re-affirmation). If Down was released
+            // mid-pose, the exit pose 28 follows
+            // instead. No walk, no root motion.
             self.slot.advance(anim, 40);
             if self.slot.repeat == 0 {
-                self.slot = AnimSlot::new(anim, 3);
+                if self.blocking {
+                    self.slot = AnimSlot::new(anim, 3);
+                } else {
+                    self.action = 28;
+                    self.slot = AnimSlot::new(anim, 28);
+                }
             }
             let target_x = self.ga - 120 + if self.facing_right { 60 } else { -60 };
             let target_y = self.gb - 266;
@@ -1116,6 +1185,28 @@ impl Player {
             let target_y = self.gb - 266;
             self.update_camera(target_x, target_y, level_w, level_h);
             return 0;
+        }
+        if self.action == 5 || self.action == 7 || self.action == 100 {
+            // Hurt reactions (Phase 6): one-shot
+            // poses (5 small, 7 big, 100 from
+            // behind) with the animation's root
+            // motion (the knockback slide), then
+            // idle. The dx is authored backward
+            // (5/7 total -32, 100 total +46, set
+            // 28672), so it is applied RAW with the
+            // facing sign — not dx.abs() like the
+            // forward-moving swings (the pull, 23,
+            // uses the same raw convention).
+            let (dx, _dy) = self.slot.advance(anim, 40);
+            self.ga += if self.facing_right { dx } else { -dx };
+            if self.slot.repeat == 0 {
+                self.action = 0;
+                self.slot = AnimSlot::new(anim, 0);
+            }
+            let target_x = self.ga - 120 + if self.facing_right { 60 } else { -60 };
+            let target_y = self.gb - 266;
+            self.update_camera(target_x, target_y, level_w, level_h);
+            return dx;
         }
         if self.action == 95 {
             // Mode-3 burst cast (Phase 3): a one-shot
@@ -2499,6 +2590,62 @@ mod tests {
         assert_eq!(pl.grabbed_box, None);
     }
 
+    #[test]
+    fn hurt_reaction_picks_7_5_or_100() {
+        // Phase 6 (e.java:5378-5382): damage > 50
+        // turns to face the attacker and plays 7;
+        // already facing the attacker plays 5;
+        // facing away plays 100.
+        let (_parsed, _flags, anim) = level_9217();
+        let spawn = (48, 560);
+        // Big hurt: facing right, attacker to the
+        // right (gf = true) -> 7, facing unchanged.
+        let mut pl = super::Player::new(&anim, spawn, true, 0, 0);
+        pl.hurt_reaction(&anim, 60, true);
+        assert_eq!(pl.action, 7);
+        assert!(pl.facing_right);
+        // Small hurt, facing the attacker -> 5.
+        let mut pl = super::Player::new(&anim, spawn, true, 0, 0);
+        pl.hurt_reaction(&anim, 10, true);
+        assert_eq!(pl.action, 5);
+        // Small hurt, facing away -> 100.
+        let mut pl = super::Player::new(&anim, spawn, true, 0, 0);
+        pl.hurt_reaction(&anim, 10, false);
+        assert_eq!(pl.action, 100);
+        // Big hurt from behind turns the player
+        // to face the attacker.
+        let mut pl = super::Player::new(&anim, spawn, true, 0, 0);
+        pl.hurt_reaction(&anim, 60, false);
+        assert_eq!(pl.action, 7);
+        assert!(!pl.facing_right);
+    }
+
+    #[test]
+    fn block_poses_27_then_3_then_28() {
+        // Phase 6: start_block enters with 27;
+        // 27 ends in the hold pose 3 while Down
+        // is held; stop_block plays the exit
+        // pose 28, which ends in idle.
+        let (_parsed, flags, anim) = level_9217();
+        let w = 232 * 16;
+        let h = 39 * 16;
+        let spawn = (48, 560);
+        let mut pl = super::Player::new(&anim, spawn, true, 0, 0);
+        assert!(pl.start_block(&anim));
+        assert_eq!(pl.action, 27);
+        assert!(pl.blocking);
+        // 27 takes 2 ticks; the hold pose follows.
+        pl.tick(&anim, &flags, w, h, 0);
+        pl.tick(&anim, &flags, w, h, 0);
+        assert_eq!(pl.action, 3, "27 should end in the hold pose 3");
+        // Release: 28, then idle.
+        pl.stop_block(&anim);
+        assert_eq!(pl.action, 28);
+        assert!(!pl.blocking);
+        pl.tick(&anim, &flags, w, h, 0);
+        pl.tick(&anim, &flags, w, h, 0);
+        assert_eq!(pl.action, 0, "28 should end in idle");
+    }
 }
 
 

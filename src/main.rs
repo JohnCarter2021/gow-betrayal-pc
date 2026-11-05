@@ -792,7 +792,11 @@ fn main() {
                             if in_front && (st.y - pl.gb).abs() < 16 {
                                 let killed = if let Ok(anim_chunk) = res.chunk(st.enemy.anim_id) {
                                     if let Ok(anim_set) = anim::load_anim_set(&anim_chunk) {
-                                        st.apply_damage(&anim_set, swing_damage)
+                                        // Heavy stagger (Phase 6):
+                                        // finisher 60/77 selects
+                                        // the heavy variants.
+                                        let heavy = matches!(pl.action, 60 | 77);
+                                        st.apply_damage(&anim_set, swing_damage, heavy)
                                     } else {
                                         false
                                     }
@@ -946,7 +950,7 @@ fn main() {
                                             if let Ok(anim_set) =
                                                 anim::load_anim_set(&anim_chunk)
                                             {
-                                                st.apply_damage(&anim_set, value)
+                                                st.apply_damage(&anim_set, value, false)
                                             } else {
                                                 false
                                             }
@@ -1167,6 +1171,7 @@ fn main() {
             max_magic: 1024,
             gold,
             combo_hits,
+            weapon_mode: pl.weapon_mode,
         };
         hud::draw_hud(&g, &mut fb, &mut res, &font, &hud_state);
         // Script dialog on top, if one is showing.

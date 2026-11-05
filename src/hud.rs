@@ -3,7 +3,10 @@
 //!
 //! Top-left (`f(Graphics)`):
 //! - portrait: anim set 1025 action 4, sprite set 1036, at (0,0).
-//! - weapon icon: sprite set 1036 frame 5 (fM = 0) at (6,17).
+//! - weapon icon: sprite set 1036 frame `5 + fM` at (6,17)
+//!   (Phase 6, e.java:2345-2346: `n = 5 + fM` — blades 5,
+//!   Artemis 6, magic modes 7/8).
+//! - health bar: outline (42,13, hm*6>>8, 3) colour 0x424242,
 //! - health bar: outline (42,13, hm*6>>8, 3) colour 0x424242,
 //!   black fill (42,14, hm*6>>8, 2), health fill colour 4783872
 //!   width hj*6>>8 at y14.
@@ -33,6 +36,9 @@ pub struct HudState {
     pub max_magic: i32,
     pub gold: i32,
     pub combo_hits: i32,
+    /// Weapon mode `fM` (Phase 6): the icon is frame
+    /// `5 + fM` of sprite set 1036.
+    pub weapon_mode: i32,
 }
 
 pub fn draw_hud(
@@ -53,7 +59,7 @@ pub fn draw_hud(
                         }
                     }
                 }
-                if let Some(frame) = portrait.frame(5) {
+                if let Some(frame) = portrait.frame((5 + hud.weapon_mode) as usize) {
                     draw_sprite_frame(g, fb, &portrait.image, frame, 6, 17, 0);
                 }
             }

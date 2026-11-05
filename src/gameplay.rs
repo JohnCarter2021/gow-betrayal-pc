@@ -102,6 +102,21 @@ pub struct Gameplay {
     /// each tick while latched. None when either
     /// set fails to load (bar disabled).
     boss_bar: Option<BarState>,
+    /// Stagger indicator (Phase 6): anim set 7168
+    /// action 31, sprite set 7169 (`bH`), slot 137
+    /// (e.java:3415 `a(137, 7168, 31)` at level
+    /// load). Drawn at each enemy with `dX > 0`
+    /// (e.java:2567-2570); the slot advances 40 ms
+    /// per staggered enemy per draw (the original's
+    /// `b(137, L)`). None when either set fails to
+    /// load (indicator disabled).
+    stagger_bar: Option<BarState>,
+    /// Previous tick's player health `hk` (Phase 6):
+    /// the hurt check compares it with the current
+    /// health to find the damage taken this tick
+    /// (e.java:5378-5400, `hk - hj`). Updated at
+    /// the end of every tick.
+    prev_player_health: i32,
     /// Level intro dialog (slice 15): the level
     /// header's Q string index, when Q > 0 (only
     /// 9217, 23552, 27648 have one). The text is
@@ -252,6 +267,23 @@ impl Gameplay {
             }
             _ => None,
         };
+        // Stagger-indicator sets (Phase 6): anim set
+        // 7168 action 31 + sprite set 7169 (`bH`),
+        // slot 137 (e.java:3415, level-load case 9).
+        let stagger_bar = match (
+            res.chunk(7168).ok().and_then(|c| anim::load_anim_set(&c).ok()),
+            res.sprite_set(7169, None).ok(),
+        ) {
+            (Some(anim_set), Some(sprites)) => {
+                let slot = crate::anim::AnimSlot::new(&anim_set, 31);
+                Some(BarState {
+                    anim: anim_set,
+                    sprites,
+                    slot,
+                })
+            }
+            _ => None,
+        };
         // Type-27 boxes (slice 22): anim set 6144 +
         // sprite set 6146 with the level palette key
         // (6150 + bG[i]).
@@ -391,6 +423,8 @@ impl Gameplay {
             kills: 0,
             bar,
             boss_bar,
+            stagger_bar,
+            prev_player_health: 1024,
             intro_index,
             intro_text,
             block_held: false,
@@ -474,7 +508,11 @@ impl Gameplay {
                         }
                         let killed = if let Ok(anim_chunk) = res.chunk(st.enemy.anim_id) {
                             if let Ok(anim_set) = anim::load_anim_set(&anim_chunk) {
-                                st.apply_damage(&anim_set, value)
+                                // Orbs never select the
+                                // heavy stagger variants
+                                // (Phase 6: those come
+                                // from a melee finisher).
+                                st.apply_damage(&anim_set, value, false)
                             } else {
                                 false
                             }
@@ -507,7 +545,16 @@ impl Gameplay {
     /// Up pressed (slice 21): while holding on a wall
     /// (action 33) it climbs up one cycle; otherwise
     /// it jumps (or double-jumps, slice 19).
+    /// Up while blocking (Phase 6, e.java:4799-4810):
+    /// the block stance exits to idle (`hw = false;
+    /// s(0)`) and the jump does NOT happen.
     pub fn jump(&mut self) -> bool {
+        if self.player.blocking {
+            self.player.blocking = false;
+            self.player.action = 0;
+            self.player.slot = anim::AnimSlot::new(&self.player_anim, 0);
+            return false;
+        }
         if self.player.action == 33 {
             return self.player.climb_up(&self.player_anim, &self.flags);
         }
@@ -828,9 +875,17 @@ impl Gameplay {
         }
         self.prev_block_held = self.block_held;
         if attack && !self.player.blocking {
-            // `A()` (slice 17): Artemis with no magic
-            // left unequips instead of swinging.
-            if self.player.is_artemis() && self.magic <= 0 {
+            // Fire while grabbing (Phase 6, e.java:5095-5097):
+            // the attack case falls through to
+            // `if (hB != 21) break; s(0);` — the
+            // grab releases to idle, no swing.
+            if self.player.action == 21 {
+                self.player.action = 0;
+                self.player.slot = anim::AnimSlot::new(&self.player_anim, 0);
+                self.player.grabbed_box = None;
+            } else if self.player.is_artemis() && self.magic <= 0 {
+                // `A()` (slice 17): Artemis with no
+                // magic left unequips instead of swinging.
                 self.player.unequip_all();
             } else if self.player.is_magic_mode3() {
                 // Phase 3: burst magic (hd). Gate:
@@ -873,6 +928,12 @@ impl Gameplay {
         }
         // Enemies tick first (as in --play), then player attack hit.
         let (px, py) = (self.player.ga, self.player.gb);
+        // The last enemy that landed an unblocked hit
+        // this tick (Phase 6): its facing gives the
+        // hurt reaction's `gf` (`!ej`, the direction
+        // the player must face to look at the
+        // attacker, e.java:6623).
+        let mut last_attacker_facing: Option<bool> = None;
         for st in &mut self.enemy_states {
             if let Ok(anim_chunk) = res.chunk(st.enemy.anim_id) {
                 if let Ok(anim_set) = anim::load_anim_set(&anim_chunk) {
@@ -892,8 +953,30 @@ impl Gameplay {
                                 anim::AnimSlot::new(&self.player_anim, 97);
                         } else {
                             self.player.health -= dmg;
+                            last_attacker_facing = Some(!st.facing_right);
                         }
                     }
+                }
+            }
+        }
+        // Hurt reactions (Phase 6, e.java:5378-5382):
+        // the deferred check after the damage lands.
+        // Guards: grounded (not 24/25/26, not
+        // climbing 33-38), not in 27/28/29 or the
+        // finishers 60/77, not grabbing a box
+        // (21/22/23, the original's `gk`), not
+        // blocking (the 97 path above already ran),
+        // alive. `ge` (grapple) is not ported.
+        let damage = self.prev_player_health - self.player.health;
+        if damage > 0 {
+            let airborne = matches!(self.player.action, 24 | 25 | 26);
+            let climbing = matches!(self.player.action, 33 | 34 | 35 | 36 | 37 | 38);
+            let grabbing = matches!(self.player.action, 21 | 22 | 23);
+            let excluded = matches!(self.player.action, 27 | 28 | 29 | 60 | 77);
+            if !airborne && !climbing && !grabbing && !excluded && !self.player.blocking && self.player.health > 0 {
+                if let Some(facing) = last_attacker_facing {
+                    self.player
+                        .hurt_reaction(&self.player_anim, damage, facing);
                 }
             }
         }
@@ -903,7 +986,9 @@ impl Gameplay {
         // Hit once per swing, at frame >= 2, for any
         // ground or air swing (slice 16; the original's
         // ht[] hitboxes are still approximated by the
-        // front-32px rule below).
+        // front-32px rule below). The heavy flag is
+        // true in a finisher (60/77) — selects the
+        // heavy stagger variants (Phase 6).
         if (crate::player::Player::is_ground_attack(self.player.action)
             || crate::player::Player::is_air_attack(self.player.action))
             && self.player.slot.frame >= 2
@@ -911,8 +996,15 @@ impl Gameplay {
         {
             self.player.attack_hit_done = true;
             let swing_damage = self.player.swing_damage;
+            let heavy = matches!(self.player.action, 60 | 77);
             for st in &mut self.enemy_states {
                 if st.dead || st.dying {
+                    continue;
+                }
+                // dX gate (Phase 6, e.java:5863/5880):
+                // while dX > 500 the melee hit does
+                // not apply at all.
+                if st.dx > 500 {
                     continue;
                 }
                 let in_front = if self.player.facing_right {
@@ -923,7 +1015,7 @@ impl Gameplay {
                 if in_front && (st.y - self.player.gb).abs() < 16 {
                     let killed = if let Ok(anim_chunk) = res.chunk(st.enemy.anim_id) {
                         if let Ok(anim_set) = anim::load_anim_set(&anim_chunk) {
-                            st.apply_damage(&anim_set, swing_damage)
+                            st.apply_damage(&anim_set, swing_damage, heavy)
                         } else {
                             false
                         }
@@ -958,6 +1050,34 @@ impl Gameplay {
                 _ => crate::pickups::GOLD,
             };
             self.pickups.spawn(x, y - 16, drop_kind, em, &mut self.rng);
+        }
+        // Mode-2 hit (Phase 6, e.java:6417-6419): while
+        // the player channels action 94, an enemy in
+        // the swing's front-32px range takes no damage
+        // — instead its dX grows by `(fK[gV] << 5) +
+        // 40` per tick. The dX > 500 gate (above)
+        // stops further hits once staggered. This
+        // runs every tick of the channel (the
+        // original's hit loop runs per tick while
+        // the attack is active).
+        if self.player.action == 94 {
+            let add = (crate::player::Player::F_K
+                [(self.player.magic_level_mode2 as usize).min(4)]
+                << 5)
+                + 40;
+            for st in &mut self.enemy_states {
+                if st.dead || st.dying || st.dx > 500 {
+                    continue;
+                }
+                let in_front = if self.player.facing_right {
+                    st.x - self.player.ga >= 0 && st.x - self.player.ga <= 32
+                } else {
+                    self.player.ga - st.x >= 0 && self.player.ga - st.x <= 32
+                };
+                if in_front && (st.y - self.player.gb).abs() < 16 {
+                    st.dx += add;
+                }
+            }
         }
         let w = self.parsed.level.pixel_width() as i32;
         let h = self.parsed.level.pixel_height() as i32;
@@ -1008,6 +1128,17 @@ impl Gameplay {
         if let Some(bar) = &mut self.bar {
             let BarState { anim, slot, .. } = bar;
             slot.advance(anim, 40);
+        }
+        // Stagger-indicator pulse (Phase 6, the
+        // original's `b(137, L)` per staggered
+        // enemy): advance 40 ms per enemy with
+        // dX > 0, so the shared slot animates.
+        if let Some(stagger) = &mut self.stagger_bar {
+            let BarState { anim, slot, .. } = stagger;
+            let n = self.enemy_states.iter().filter(|st| !st.dead && !st.dying && st.dx > 0).count();
+            for _ in 0..n {
+                slot.advance(anim, 40);
+            }
         }
         // Boss-bar pulse (Phase 2, `t(131)`): the
         // slot advances each tick while the `@`
@@ -1070,6 +1201,9 @@ impl Gameplay {
                 }
             }
         }
+        // End of tick (Phase 6): record the player's
+        // health for next tick's hurt check (`hk`).
+        self.prev_player_health = self.player.health;
     }
 
     /// Flag-4 respawn (Phase 4, type-14): when the
@@ -1175,6 +1309,20 @@ impl Gameplay {
                 self.player.cam_y,
             );
         }
+        // Stagger indicators (Phase 6): slot 137
+        // above each enemy with dX > 0.
+        if let Some(stagger) = &self.stagger_bar {
+            enemies::draw_stagger_indicators(
+                &g,
+                fb,
+                &stagger.anim,
+                &stagger.sprites,
+                stagger.slot.visual,
+                &self.enemy_states,
+                self.player.cam_x,
+                self.player.cam_y,
+            );
+        }
         let player_transform = if self.player.facing_right { 0 } else { 2 };
         if let Ok(frames) = anim::frames_for_timeline_frame(&self.player_anim, self.player.action, self.player.slot.visual, player_transform) {
             for fr in frames {
@@ -1203,6 +1351,7 @@ impl Gameplay {
             max_magic: self.max_magic,
             gold: self.gold,
             combo_hits: self.combo_hits,
+            weapon_mode: self.player.weapon_mode,
         };
         hud::draw_hud(&g, fb, res, font, &hud_state);
         // Arena kills HUD (Phase 5, rest, e.java
@@ -1616,6 +1765,14 @@ mod tests {
         // Away from the spawn tutorial (its first
         // step is a `!` cutscene, Phase 4).
         gp.player.ga = 416;
+        // Phase 6: the nearby enemy would hit the
+        // player mid-combo and the hurt reaction
+        // would interrupt the swing (as in the
+        // original) — this test is about the chain,
+        // so the enemy deals no damage here.
+        for st in &mut gp.enemy_states {
+            st.el = 0;
+        }
         t(&mut gp, &mut res, 0, true);
         assert_eq!(gp.player.action, 54);
         assert_eq!(gp.player.combo_step, 1);
@@ -1685,6 +1842,27 @@ mod tests {
         // facing right; it attacks in place instead
         // of walking, so it stays in range.
         gp.player.ga = 416;
+        // Phase 6: the enemy deals no damage here
+        // (its hit would play the hurt reaction and
+        // interrupt the swing, as in the original) —
+        // this test is about the damage numbers.
+        for st in &mut gp.enemy_states {
+            st.el = 0;
+        }
+        // Follow the enemy's stagger slide (Phase 6):
+        // each hit slides it back ~26 px, so the
+        // player steps up to stay in the 32 px
+        // swing range.
+        let follow = |gp: &mut super::Gameplay| {
+            let x = gp
+                .enemy_states
+                .iter()
+                .find(|st| st.enemy.x == 448)
+                .map(|st| st.x)
+                .unwrap();
+            gp.player.ga = x - 16;
+            gp.player.facing_right = true;
+        };
         let health = |gp: &super::Gameplay| {
             gp.enemy_states
                 .iter()
@@ -1707,6 +1885,7 @@ mod tests {
         // still running with the cancel window open
         // (four would run past the 54 swing's end).
         for (want_action, want_health) in [(55, 9), (56, 5)] {
+            follow(&mut gp);
             for _ in 0..2 {
                 t(&mut gp, &mut res, 0, false);
             }
@@ -1755,6 +1934,14 @@ mod tests {
         assert_eq!(gp.player.action, 72);
         assert_eq!(gp.player.combo_step, 1);
         assert_eq!(gp.player.swing_damage, 4);
+        // Phase 6: the nearby enemy would hit the
+        // player mid-combo and the hurt reaction
+        // would interrupt the swing (as in the
+        // original) — this test is about the chain,
+        // so the enemy deals no damage here.
+        for st in &mut gp.enemy_states {
+            st.el = 0;
+        }
         for (want_action, want_step, want_dmg, want_finisher) in [
             (73, 2, 10, false),
             (77, 2, 10, true),
@@ -2001,8 +2188,18 @@ mod tests {
         gp.dismiss_intro();
         gp.player.ga = 416;
         gp.block_held = true;
+        // Phase 6: Down enters the block with the
+        // enter pose 27, which becomes the hold
+        // pose 3 when it ends while Down is held.
         t(&mut gp, &mut res, 0, false);
         assert!(gp.player.blocking);
+        assert!(matches!(gp.player.action, 27 | 3));
+        for _ in 0..10 {
+            t(&mut gp, &mut res, 0, false);
+            if gp.player.action == 3 {
+                break;
+            }
+        }
         assert_eq!(gp.player.action, 3);
         let mut reacted = false;
         for _ in 0..80 {
@@ -2015,8 +2212,15 @@ mod tests {
         assert!(reacted, "blocked hit never played action 97");
         assert_eq!(gp.player.health, 1024, "blocked hit must deal no damage");
         assert!(gp.player.facing_right, "reaction should face the attacker");
+        // Phase 6: releasing Down plays the exit
+        // pose 28 before returning to idle.
         gp.block_held = false;
-        t(&mut gp, &mut res, 0, false);
+        for _ in 0..10 {
+            t(&mut gp, &mut res, 0, false);
+            if gp.player.action == 0 {
+                break;
+            }
+        }
         assert_eq!(gp.player.action, 0);
         assert!(!gp.player.blocking);
     }
@@ -2035,7 +2239,17 @@ mod tests {
         // step is a `!` cutscene, Phase 4).
         gp.player.ga = 416;
         gp.block_held = true;
+        // Phase 6: Down enters with pose 27, then
+        // the hold pose 3.
         t(&mut gp, &mut res, 0, false);
+        assert!(gp.player.blocking);
+        assert!(matches!(gp.player.action, 27 | 3));
+        for _ in 0..10 {
+            t(&mut gp, &mut res, 0, false);
+            if gp.player.action == 3 {
+                break;
+            }
+        }
         assert_eq!(gp.player.action, 3);
         assert!(gp.player.blocking);
         t(&mut gp, &mut res, 0, true);
@@ -2055,10 +2269,142 @@ mod tests {
         }
         assert!(resumed, "reaction did not resume the block pose");
         assert!(gp.player.blocking);
+        // Phase 6: releasing Down plays the exit
+        // pose 28 before returning to idle.
         gp.block_held = false;
-        t(&mut gp, &mut res, 0, false);
+        for _ in 0..10 {
+            t(&mut gp, &mut res, 0, false);
+            if gp.player.action == 0 {
+                break;
+            }
+        }
         assert_eq!(gp.player.action, 0);
         assert!(!gp.player.blocking);
+    }
+
+    #[test]
+    fn enemy_hit_plays_hurt_reaction() {
+        // Phase 6 (e.java:5378-5382): an unblocked
+        // enemy hit plays the hurt reaction — the
+        // player at 416 faces the 448 enemy (to the
+        // right), so the small hurt (5) plays.
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        gp.player.ga = 416;
+        gp.player.facing_right = true;
+        let hp0 = gp.player.health;
+        let mut hurt = false;
+        for _ in 0..200 {
+            t(&mut gp, &mut res, 0, false);
+            if gp.player.action == 5 || gp.player.action == 7 || gp.player.action == 100 {
+                hurt = true;
+                break;
+            }
+        }
+        assert!(hurt, "enemy hit never played a hurt reaction");
+        assert_eq!(gp.player.action, 5, "facing the attacker should play 5");
+        assert!(gp.player.health < hp0, "the hit should deal damage");
+    }
+
+    #[test]
+    fn mode2_hit_builds_dx_and_gate_blocks_swings() {
+        // Phase 6 (e.java:6417-6419, 5863/5880):
+        // a mode-2 channel hit adds dX instead of
+        // damage, and while dX > 500 melee swings
+        // do not apply.
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        gp.player.ga = 416;
+        gp.player.facing_right = true;
+        gp.player.weapon_mode = 2;
+        gp.magic = 500;
+        // Stand next to the 448 enemy and channel.
+        let idx = gp
+            .enemy_states
+            .iter()
+            .position(|s| s.enemy.x == 448)
+            .unwrap();
+        gp.player.magic_level_mode2 = 0;
+        t(&mut gp, &mut res, 0, true);
+        assert_eq!(gp.player.action, 94, "mode 2 should start the channel");
+        // Channel a few ticks: dX grows by
+        // (fK[0] << 5) + 40 = 104 per tick.
+        for _ in 0..3 {
+            t(&mut gp, &mut res, 0, true);
+        }
+        assert!(
+            gp.enemy_states[idx].dx > 0,
+            "mode-2 hits should build dX, got {}",
+            gp.enemy_states[idx].dx
+        );
+        // Gate: with dX > 500, a blades swing
+        // deals no damage.
+        gp.enemy_states[idx].dx = 600;
+        let hp = gp.enemy_states[idx].health;
+        gp.player.weapon_mode = 0;
+        gp.player.action = 54;
+        gp.player.slot = super::anim::AnimSlot::new(&gp.player_anim, 54);
+        gp.player.attack_hit_done = false;
+        gp.player.swing_damage = 2;
+        gp.player.slot.frame = 2;
+        t(&mut gp, &mut res, 0, false);
+        assert_eq!(
+            gp.enemy_states[idx].health, hp,
+            "swing must not damage a dX > 500 enemy"
+        );
+    }
+
+    #[test]
+    fn fire_while_grabbing_releases_to_idle() {
+        // Phase 6 (e.java:5095-5097): attack while
+        // grabbing a box releases to idle, no swing.
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        // Walk to the crate and grab it (slice 22).
+        gp.player.ga = 2048 - 32;
+        gp.player.gb = 560;
+        gp.player.facing_right = true;
+        let mut grabbed = false;
+        for _ in 0..40 {
+            t(&mut gp, &mut res, 1, false);
+            if gp.player.action == 21 {
+                grabbed = true;
+                break;
+            }
+        }
+        assert!(grabbed, "never grabbed the crate");
+        assert!(gp.player.grabbed_box.is_some());
+        t(&mut gp, &mut res, 0, true);
+        assert_eq!(gp.player.action, 0, "attack while grabbing should release to idle");
+        assert_eq!(gp.player.grabbed_box, None);
+    }
+
+    #[test]
+    fn up_while_blocking_unblocks_without_jumping() {
+        // Phase 6 (e.java:4799-4810): Up while
+        // blocking exits the stance to idle and
+        // does NOT jump.
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        gp.player.ga = 416;
+        gp.block_held = true;
+        for _ in 0..10 {
+            t(&mut gp, &mut res, 0, false);
+            if gp.player.action == 3 {
+                break;
+            }
+        }
+        assert_eq!(gp.player.action, 3);
+        assert!(gp.player.blocking);
+        let gb = gp.player.gb;
+        assert!(!gp.jump(), "Up while blocking must not jump");
+        assert_eq!(gp.player.action, 0);
+        assert!(!gp.player.blocking);
+        assert_eq!(gp.player.gb, gb, "no jump arc should start");
     }
 
     #[test]
@@ -2468,6 +2814,7 @@ mod tests {
         );
         assert_eq!(gp.boxes[1].x, 130 * 16, "box slid to its new tile: {}", gp.boxes[1].x);
     }
+
 }
 
 #[cfg(test)]
