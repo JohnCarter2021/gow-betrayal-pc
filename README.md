@@ -2,9 +2,10 @@
 
 A Rust PC port, in progress, of *God of War: Betrayal* (J2ME, Glu Mobile, v1.4.8).
 
-Status, 2026-11-04 — v0.4.0: slices 1–2 (menus), slice 3 (gameplay),
-wiring, window layer (timing/scaling), file-backed save, all levels +
-Arena, Help/About, MIDI audio playback, and a playable OS window:
+Status, 2026-11-05 — v0.5.0: everything in v0.4.0, plus slices 9–18
+(jump + gravity, enemy death animation, stagger, orb/gold drops,
+script triggers + level-complete flow, weakened-enemy markers, level
+intro dialogs, combat combos + air attacks, weapons, blocking):
 
 - **MIDP shim, std-only, no crates:** 240×320 framebuffer, `Graphics`
   (clip / translate / `drawRegion` with all 8 MIDP transforms), sprite
@@ -48,10 +49,41 @@ Arena, Help/About, MIDI audio playback, and a playable OS window:
   (hold to walk), Enter/Space = Select, Space in gameplay = Attack,
   Escape = Back. Feature-gated: build with `--features window`;
   the default build stays std-only.
+- **Jump + gravity, slice 9:** Up starts the jump arc (action 24),
+  with landing snaps and falling (action 26) under the original's
+  gravity code.
+- **Enemy death + stagger, slices 10–11:** killing blows play the
+  death action (8/7); non-lethal hits stagger (2/4) and interrupt
+  attacks.
+- **Orbs, slice 12:** enemies drop gold/health/magic orbs (split
+  18/9 over 60, else 6/3, max 19) that home in on the player with a
+  4-frame trail.
+- **Scripts + level flow, slice 13:** type-8 tile triggers fire
+  story dialogs (`^`), auto-advance cutscene steps (`!`), and the
+  level-end (`*`) which saves progress and loads the next level.
+  Boss-latch triggers (`@`) are consumed silently for now.
+- **Markers + intros, slices 14–15:** a pulsing marker above
+  enemies below half health; levels with a header Q (9217, 23552,
+  27648) open with an intro dialog.
+- **Combos + air attacks, slice 16:** ground chain 54/55/56 +
+  finisher 60, air attacks 67/68/69, 150 ms cancel-window buffering,
+  damage from the save's combo level/shift.
+- **Weapons, slice 17:** left softkey cycles blades / Blade of
+  Artemis / two magic modes; Artemis has its own combos (72/73/77,
+  83/84/85) with heavier damage and a magic drain per hit; empty
+  magic unequips back to blades. Magic casts are not ported yet.
+- **Blocking, slice 18:** hold Down for the guard pose (action 3);
+  blocked hits deal no damage and play the block-impact reaction
+  (action 97) facing the attacker; attacks are ignored while
+  blocking.
 
-Verified locally: `cargo test --release` 38/38. The v0.2.0 Windows
+Controls in the window: hold Left/Right to walk, Up to jump,
+hold Down to block, Space to attack, Enter to cycle weapon
+(Select) / advance dialogs, Escape to go back.
+
+Verified locally: `cargo test --release` 65/65. The v0.2.0 Windows
 exe was verified on a real Windows PC (all modes match Linux).
-The v0.4.0 Windows exe is cross-compiled on Linux
+The v0.5.0 Windows exe is cross-compiled on Linux
 (x86_64-pc-windows-gnu, MinGW target) with the window feature;
 the window and the MIDI sound themselves have **not** been run
 yet — this VM is headless and has no MIDI synth, so the user's

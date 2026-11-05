@@ -377,3 +377,4 @@ mod spawn_tests {
         assert_eq!(kind_name(4), None); // not yet proven, stays unnamed
     }
 }
+

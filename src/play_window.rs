@@ -60,7 +60,9 @@ pub fn run(dir: &std::path::Path, factor: usize, save_dir: Option<&str>) -> i32 
         factor,
         left: false,
         right: false,
+        down: false,
         attack_queued: false,
+        jump_queued: false,
         next_frame: Instant::now(),
     };
     let _ = event_loop.run_app(&mut app);
@@ -75,7 +77,9 @@ struct App {
     factor: usize,
     left: bool,
     right: bool,
+    down: bool,
     attack_queued: bool,
+    jump_queued: bool,
     next_frame: Instant,
 }
 
@@ -90,11 +94,15 @@ impl App {
             0
         };
         self.game.held_dir = dir;
+        self.game.held_down = self.down;
         self.game.tick(40);
         if self.game.state == State::Playing {
             if self.attack_queued {
                 self.game.tick_playing_attack();
                 self.attack_queued = false;
+            } else if self.jump_queued {
+                self.game.tick_playing_jump();
+                self.jump_queued = false;
             } else {
                 self.game.tick_playing();
             }
@@ -147,11 +155,22 @@ impl App {
             }
             KeyCode::ArrowUp => {
                 if pressed {
-                    self.game.update(Some(Input::Up));
+                    if self.game.state == State::Playing {
+                        // Queued like Attack: the frame step runs
+                        // exactly one jump frame for this press.
+                        self.jump_queued = true;
+                    } else {
+                        self.game.update(Some(Input::Up));
+                    }
                 }
             }
             KeyCode::ArrowDown => {
-                if pressed {
+                // Hold-to-block (slice 18): like the
+                // walk arrows, the held state drives
+                // every frame; menus still get the
+                // press for scrolling.
+                self.down = pressed;
+                if pressed && self.game.state != State::Playing {
                     self.game.update(Some(Input::Down));
                 }
             }

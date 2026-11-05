@@ -14,6 +14,8 @@
 //! Build with the cargo in ~/.cargo/bin (not on the default PATH here):
 //!   ~/.cargo/bin/cargo run --release -- ../extracted --render-test ../test-frame.png
 
+mod pickups;
+mod script;
 #[cfg(feature = "window")]
 mod play_window;
 mod anim;
@@ -407,52 +409,203 @@ fn main() {
         for e in enemy_list0 {
             if let Ok(anim_chunk) = res.chunk(e.anim_id) {
                 if let Ok(anim_set) = anim::load_anim_set(&anim_chunk) {
-                    enemy_states.push(enemies::EnemyState::new(e, &anim_set));
+                    let mut st = enemies::EnemyState::new(e.clone(), &anim_set);
+                    if let Ok(sprites) = res.sprite_set(e.sprite_id, None) {
+                        st.ef = enemies::enemy_bbox_height(&anim_set, &sprites, e.action);
+                    }
+                    enemy_states.push(st);
                 }
             }
         }
+        // Weakened-marker sets (slice 14).
+        let mut bar_state: Option<(
+            anim::AnimSet,
+            resources::SpriteSet,
+            anim::AnimSlot,
+        )> = match (
+            res.chunk(1027).ok().and_then(|c| anim::load_anim_set(&c).ok()),
+            res.sprite_set(1040, None).ok(),
+        ) {
+            (Some(anim_set), Some(sprites)) => {
+                let slot = anim::AnimSlot::new(&anim_set, 10);
+                Some((anim_set, sprites, slot))
+            }
+            _ => None,
+        };
         let mut held = 0;
+        let mut block_held = false;
         let mut combo_hits = 0;
         let mut combo_timer_ms = 0;
+        let mut pickups = pickups::Pickups::default();
+        let mut gold = 0;
+        let mut magic = 0;
+        let mut orb_rng = pickups::OrbRng(0x9E3779B9);
+        // Script triggers (type 8) + English strings.
+        let mut script_triggers = Vec::new();
+        if let Some(g8) = parsed.group(8) {
+            for (i, &(px, py)) in g8.positions.iter().enumerate() {
+                script_triggers.push(script::ScriptTrigger {
+                    tile_x: px / 16,
+                    tile_y: py / 16,
+                    start: g8.extra.get(i * 2).copied().unwrap_or(0) as usize,
+                    len: g8.extra.get(i * 2 + 1).copied().unwrap_or(0) as usize,
+                });
+            }
+        }
+        let script_strings = res.strings(10240).unwrap_or_default();
+        // Level intro dialog (slice 15): shown before
+        // gameplay when the level header Q > 0.
+        let mut intro_text = if parsed.level.q > 0 {
+            script_strings.get(parsed.level.q as usize).cloned()
+        } else {
+            None
+        };
+        let mut script_engine = script::ScriptEngine::new(script_triggers, script_strings);
+        let mut play_completed = false;
         for key in &keys {
             match key.as_str() {
                 "left" => held = -1,
                 "right" => held = 1,
-                "attack" => {
+                "down" => {
+                    // Hold-to-block (slice 18).
+                    block_held = true;
+                    println!("player blocks");
+                }
+                "release" => {
+                    // Release Down: end the block.
+                    block_held = false;
+                    println!("player stops blocking");
+                }
+                "up" => {
                     if let Ok(anim_chunk) = res.chunk(28672) {
                         if let Ok(anim_set) = anim::load_anim_set(&anim_chunk) {
-                            if pl.attack(&anim_set) {
-                                println!("player attacks (action 54)");
+                            if pl.jump(&anim_set) {
+                                println!("player jumps (action 24)");
                             }
                         }
                     }
                 }
+                "attack" => {
+                    // No attack while blocking (slice 18).
+                    if pl.blocking {
+                        println!("blocked stance, attack ignored");
+                        continue;
+                    }
+                    // `A()` (slice 17): Artemis with no
+                    // magic left unequips instead.
+                    if pl.is_artemis() && magic <= 0 {
+                        pl.unequip_all();
+                        println!("magic spent, back to blades");
+                        continue;
+                    }
+                    if let Ok(anim_chunk) = res.chunk(28672) {
+                        if let Ok(anim_set) = anim::load_anim_set(&anim_chunk) {
+                            if pl.attack(&anim_set) {
+                                println!(
+                                    "player attacks (action {} combo {} dmg {} buffered {})",
+                                    pl.action,
+                                    pl.combo_step,
+                                    pl.swing_damage,
+                                    pl.attack_buffered
+                                );
+                            }
+                        }
+                    }
+                }
+                "cycle" => {
+                    // Left softkey / '*' (slice 17).
+                    if pl.cycle_weapon() {
+                        println!("weapon cycled to mode {}", pl.weapon_mode);
+                    } else {
+                        println!("weapon cycle blocked (attacking)");
+                    }
+                }
+                "select" => {
+                    // An intro dialog dismisses first.
+                    if intro_text.is_some() {
+                        intro_text = None;
+                        println!("intro dismissed, gameplay starts");
+                        continue;
+                    }
+                    // Advance the active script (Select key).
+                    match script_engine.advance() {
+                        script::ScriptEvent::Dialog(text) => {
+                            println!("script dialog: {text}");
+                        }
+                        script::ScriptEvent::Ended => {
+                            println!("script ended, gameplay resumes");
+                        }
+                        script::ScriptEvent::LevelComplete => {
+                            play_completed = true;
+                            println!(
+                                "LEVEL COMPLETE: next level index {}",
+                                gameplay::level_index(level_id) + 1
+                            );
+                        }
+                        script::ScriptEvent::None => {}
+                    }
+                    if let Some(mode) = script_engine.take_weapon_switch() {
+                        pl.weapon_mode = mode;
+                        println!("script weapon switch: mode {mode}");
+                    }
+                }
                 "tick" => {
+                    // A showing intro or script dialog
+                    // freezes the world.
+                    if intro_text.is_some() || script_engine.active() {
+                        continue;
+                    }
                     if combo_timer_ms > 0 {
                         combo_timer_ms -= 40;
                         if combo_timer_ms <= 0 {
                             combo_hits = 0;
                         }
                     }
+                    // Block stance (slice 18): Down held
+                    // starts it, release ends it.
+                    if block_held {
+                        if !pl.blocking || pl.action == 0 {
+                            pl.start_block(&player_anim);
+                        }
+                    } else if pl.blocking {
+                        pl.stop_block(&player_anim);
+                    }
                     for st in &mut enemy_states {
                         if let Ok(anim_chunk) = res.chunk(st.enemy.anim_id) {
                             if let Ok(anim_set) = anim::load_anim_set(&anim_chunk) {
                                 let dmg = st.tick(&anim_set, &flags, pl.ga, pl.gb);
                                 if dmg > 0 {
-                                    pl.health -= dmg;
-                                    println!(
-                                        "enemy {} hits player for {} (player health {}/{})",
-                                        st.enemy.index, dmg, pl.health, pl.max_health
-                                    );
+                                    if pl.blocking {
+                                        // Blocked hit: no damage,
+                                        // block-impact reaction.
+                                        pl.facing_right = !st.facing_right;
+                                        pl.action = 97;
+                                        pl.slot = anim::AnimSlot::new(&player_anim, 97);
+                                        println!(
+                                            "enemy {} hit blocked (player health {}/{})",
+                                            st.enemy.index, pl.health, pl.max_health
+                                        );
+                                    } else {
+                                        pl.health -= dmg;
+                                        println!(
+                                            "enemy {} hits player for {} (player health {}/{})",
+                                            st.enemy.index, dmg, pl.health, pl.max_health
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
                     // Player attack hit: once per swing, at frame >= 2.
-                    if pl.action == 54 && pl.slot.frame >= 2 && !pl.attack_hit_done {
+                    if (player::Player::is_ground_attack(pl.action)
+                        || player::Player::is_air_attack(pl.action))
+                        && pl.slot.frame >= 2
+                        && !pl.attack_hit_done
+                    {
                         pl.attack_hit_done = true;
+                        let swing_damage = pl.swing_damage;
                         for st in &mut enemy_states {
-                            if st.dead {
+                            if st.dead || st.dying {
                                 continue;
                             }
                             let in_front = if pl.facing_right {
@@ -461,15 +614,42 @@ fn main() {
                                 pl.ga - st.x >= 0 && pl.ga - st.x <= 32
                             };
                             if in_front && (st.y - pl.gb).abs() < 16 {
-                                let killed = st.apply_damage(2);
+                                let killed = if let Ok(anim_chunk) = res.chunk(st.enemy.anim_id) {
+                                    if let Ok(anim_set) = anim::load_anim_set(&anim_chunk) {
+                                        st.apply_damage(&anim_set, swing_damage)
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
                                 combo_hits += 1;
                                 combo_timer_ms = 2000;
+                                // Artemis drains magic per hit
+                                // (slice 17): `fJ * 3`, clamped at 0.
+                                if pl.is_artemis() {
+                                    magic = (magic - swing_damage * 3).max(0);
+                                }
                                 println!(
-                                    "player hits enemy {} for 2 (health {}){}",
+                                    "player hits enemy {} for {} (health {}){}",
                                     st.enemy.index,
+                                    swing_damage,
                                     st.health,
                                     if killed { " - DIED" } else { "" }
                                 );
+                                if killed {
+                                    let drop_kind = match st.enemy.kind {
+                                        12 => pickups::MAGIC,
+                                        _ => pickups::GOLD,
+                                    };
+                                    pickups.spawn(
+                                        st.x,
+                                        st.y - 16,
+                                        drop_kind,
+                                        st.enemy.em,
+                                        &mut orb_rng,
+                                    );
+                                }
                             }
                         }
                     }
@@ -480,6 +660,51 @@ fn main() {
                         parsed.level.pixel_height() as i32,
                         held,
                     );
+                    // Pickups home on the player's new position.
+                    let enemy_pos: Vec<(i32, i32, bool)> = enemy_states
+                        .iter()
+                        .map(|st| (st.x, st.y, !st.dead))
+                        .collect();
+                    for ev in pickups.update((pl.ga, pl.gb), &enemy_pos) {
+                        match ev {
+                            pickups::PickupEvent::Collected { kind, value } => match kind {
+                                pickups::GOLD => gold += value,
+                                pickups::HEALTH => {
+                                    pl.health = (pl.health + value).min(pl.max_health)
+                                }
+                                pickups::MAGIC => magic = (magic + value).min(1024),
+                                _ => {}
+                            },
+                            pickups::PickupEvent::HitEnemy { .. } => {
+                                // No damage orbs exist in --play yet
+                                // (they only spawn from magic weapons).
+                            }
+                        }
+                    }
+                    // Weakened-marker pulse (t(132)).
+                    if let Some((bar_anim, _, bar_slot)) = &mut bar_state {
+                        bar_slot.advance(bar_anim, 40);
+                    }
+                    // Script trigger check on the new tile.
+                    if !play_completed {
+                        match script_engine.check_trigger(pl.ga / 16, pl.gb / 16) {
+                            script::ScriptEvent::Dialog(text) => {
+                                println!("script dialog: {text}");
+                            }
+                            script::ScriptEvent::LevelComplete => {
+                                play_completed = true;
+                                println!(
+                                    "LEVEL COMPLETE: next level index {}",
+                                    gameplay::level_index(level_id) + 1
+                                );
+                            }
+                            _ => {}
+                        }
+                        if let Some(mode) = script_engine.take_weapon_switch() {
+                            pl.weapon_mode = mode;
+                            println!("script weapon switch: mode {mode}");
+                        }
+                    }
                     println!(
                         "tick: ga={} gb={} action={} visual={} cam=({},{}) step={}",
                         pl.ga, pl.gb, pl.action, pl.slot.visual, pl.cam_x, pl.cam_y, step
@@ -488,8 +713,12 @@ fn main() {
                 _ => {}
             }
         }
-        // A final tick with no input settles idle, unless keys ended on tick.
-        if keys.last().map(|k| k.as_str()) != Some("tick") {
+        // A final tick with no input settles idle, unless keys ended on tick
+        // or a script dialog is showing (frozen world).
+        if keys.last().map(|k| k.as_str()) != Some("tick")
+            && !script_engine.active()
+            && intro_text.is_none()
+        {
             pl.tick(
                 &player_anim,
                 &flags,
@@ -519,10 +748,28 @@ fn main() {
         }
         let (drawn, skipped) = enemies::draw_enemy_states(&g, &mut fb, &mut res, &enemy_states, pl.cam_x, pl.cam_y);
         println!("enemies: {} drawn, {} skipped, {} total", drawn, skipped, enemy_states.len());
+        if let Some((bar_anim, bar_sprites, bar_slot)) = &bar_state {
+            enemies::draw_weakened_markers(
+                &g,
+                &mut fb,
+                bar_anim,
+                bar_sprites,
+                bar_slot.visual,
+                &enemy_states,
+                pl.cam_x,
+                pl.cam_y,
+            );
+        }
         for st in &enemy_states {
             println!(
-                "  enemy {}: type {} at ({},{}) facing_right={} action={} visual={}",
-                st.enemy.index, st.enemy.kind, st.x, st.y, st.facing_right, st.action, st.slot.visual
+                "  enemy {}: type {} at ({},{}) facing_right={} action={} visual={} health={}/{} ef={}",
+                st.enemy.index, st.enemy.kind, st.x, st.y, st.facing_right, st.action, st.slot.visual, st.health, st.max_health, st.ef
+            );
+        }
+        for (i, o) in pickups.orbs.iter().enumerate() {
+            println!(
+                "  orb {}: kind={} value={} at ({},{}) v=({},{}) age={}",
+                i, o.kind, o.value, o.x, o.y, o.vx, o.vy, o.age_ms
             );
         }
         let player_transform = if pl.facing_right { 0 } else { 2 };
@@ -541,18 +788,27 @@ fn main() {
                 );
             }
         }
+        pickups.draw(&g, &mut fb, &mut res, pl.cam_x, pl.cam_y);
         // HUD (3e): health/magic bars, gold, bottom bar.
         let font_set = res.sprite_set(1031, None).expect("font sprite set 1031");
         let font = font::Font::from_sprite_set(font_set);
         let hud_state = hud::HudState {
             health: pl.health,
             max_health: pl.max_health,
-            magic: 0,
+            magic,
             max_magic: 1024,
-            gold: 0,
+            gold,
             combo_hits,
         };
         hud::draw_hud(&g, &mut fb, &mut res, &font, &hud_state);
+        // Script dialog on top, if one is showing.
+        if let Some(text) = script_engine.dialog_text() {
+            gameplay::draw_dialog_box(&mut fb, &font, text);
+        }
+        // Level intro dialog on top of that.
+        if let Some(text) = &intro_text {
+            gameplay::draw_dialog_box(&mut fb, &font, text);
+        }
         let rgba = fb.to_rgba();
         fs::write(
             format!("{prefix}.png"),
@@ -560,8 +816,8 @@ fn main() {
         )
         .expect("write play frame");
         println!(
-            "player final: ga={} gb={} action={} visual={} cam=({},{}) health={}/{} wrote {prefix}.png",
-            pl.ga, pl.gb, pl.action, pl.slot.visual, pl.cam_x, pl.cam_y, pl.health, pl.max_health
+            "player final: ga={} gb={} action={} visual={} cam=({},{}) health={}/{} gold={} orbs={} completed={} intro={} wrote {prefix}.png",
+            pl.ga, pl.gb, pl.action, pl.slot.visual, pl.cam_x, pl.cam_y, pl.health, pl.max_health, gold, pickups.orbs.len(), play_completed, intro_text.is_some()
         );
         return;
     }

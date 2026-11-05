@@ -34,6 +34,9 @@ pub struct Enemy {
     /// Base damage `el` (extra[5]): player damage = el<<1
     /// (action 5) or el<<2 (action 6) for a normal enemy.
     pub el: i32,
+    /// Orb value `em` (extra[4]): the value passed to
+    /// the pickup spawner `b()` when this enemy dies.
+    pub em: i32,
     pub anim_id: u32,
     pub sprite_id: u32,
     pub action: usize,
@@ -83,6 +86,7 @@ pub fn enemies(parsed: &LevelEntities) -> Vec<Enemy> {
                 health: e[3] as i32,
                 ev,
                 el: e[5] as i32,
+                em: e[4] as i32,
                 anim_id,
                 sprite_id,
                 action: if ev { 1 } else { 0 },
@@ -198,10 +202,88 @@ mod tests {
         let anim_pack = crate::rp::parse_pack(&anim_data).unwrap();
         let anim = crate::anim::load_anim_set(&anim_pack.chunk(0).unwrap()).unwrap();
         let mut st = super::EnemyState::new(enemy, &anim);
-        assert!(!st.apply_damage(2));
+        assert!(!st.apply_damage(&anim, 2));
         assert_eq!(st.health, 1);
-        assert!(st.apply_damage(2));
-        assert!(st.dead);
+        assert!(st.apply_damage(&anim, 2));
+        // Killing blow starts the death animation (kind 11
+        // -> action 8, ~1.6 s), not instant removal.
+        assert!(st.dying);
+        assert!(!st.dead);
+        assert_eq!(st.action, 8);
+        // Further hits are ignored while dying.
+        assert!(!st.apply_damage(&anim, 2));
+        // Advance until the animation finishes.
+        let flags = crate::player::TileFlags::build(&parsed);
+        for _ in 0..100 {
+            st.tick(&anim, &flags, 436, 560);
+            if st.dead {
+                break;
+            }
+        }
+        assert!(st.dead, "death animation never finished");
+        assert!(!st.dying);
+    }
+
+    #[test]
+    fn enemy_staggers_on_nonlethal_hit_then_recovers() {
+        let data = std::fs::read("../extracted/RP9").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        let chunk = pack.chunk(1).unwrap();
+        let parsed = crate::entities::parse_level_entities(9217, &chunk).unwrap();
+        let list = super::enemies(&parsed);
+        let enemy = list.iter().find(|e| e.x == 448).unwrap().clone();
+        assert_eq!(enemy.health, 13);
+        let anim_data = std::fs::read("../extracted/RP18").unwrap();
+        let anim_pack = crate::rp::parse_pack(&anim_data).unwrap();
+        let anim = crate::anim::load_anim_set(&anim_pack.chunk(0).unwrap()).unwrap();
+        let mut st = super::EnemyState::new(enemy, &anim);
+        assert!(!st.apply_damage(&anim, 2));
+        assert_eq!(st.health, 11);
+        assert!(!st.dead && !st.dying);
+        assert_eq!(st.action, 2, "kind 11 staggers with action 2");
+        // While staggering, the enemy neither attacks nor
+        // moves, even with the player in attack range.
+        let flags = crate::player::TileFlags::build(&parsed);
+        let dmg = st.tick(&anim, &flags, 458, 560);
+        assert_eq!(dmg, 0);
+        assert_eq!(st.action, 2);
+        // Action 2 runs ~600 ms = 15 ticks; it must end
+        // back at idle, alive.
+        for _ in 0..30 {
+            st.tick(&anim, &flags, 458, 560);
+            if st.action == 0 {
+                break;
+            }
+        }
+        assert_eq!(st.action, 0, "stagger never finished");
+        assert!(!st.dead);
+    }
+
+    #[test]
+    fn weakened_marker_rule() {
+        use super::weakened_marker_visible as vis;
+        // Full health: no marker. At exactly half:
+        // no marker (ek < en>>1 is strict).
+        assert!(!vis(13, 13, false, false));
+        assert!(!vis(6, 13, false, false));
+        // Below half: marker. Dead/dying: none, even
+        // with low health. Negative health: none.
+        assert!(vis(5, 13, false, false));
+        assert!(!vis(5, 13, true, false));
+        assert!(!vis(5, 13, false, true));
+        assert!(!vis(-1, 13, false, false));
+    }
+
+    #[test]
+    fn enemy_bbox_height_is_positive() {
+        // Kind-11 enemy (set 18432, sprite 18433),
+        // initial action 0: ef must be a real height.
+        let mut res = crate::resources::Resources::new("../extracted");
+        let anim_chunk = res.chunk(18432).unwrap();
+        let anim = crate::anim::load_anim_set(&anim_chunk).unwrap();
+        let sprites = res.sprite_set(18433, None).unwrap();
+        let ef = super::enemy_bbox_height(&anim, &sprites, 0);
+        assert!(ef > 16 && ef < 128, "ef = {ef}");
     }
 }
 
@@ -229,6 +311,20 @@ pub struct EnemyState {
     pub slot: anim::AnimSlot,
     /// Current health `ek` (starts at `en`, extra[3]).
     pub health: i32,
+    /// Max health `en` (extra[3] at spawn).
+    pub max_health: i32,
+    /// Bbox height `ef` (P[3] from the spawn-time
+    /// `a(set, slot, 0, 0, 0, P)` call): height of the
+    /// initial action's timeline-0 composition. Set by
+    /// the caller via `set_ef` once the enemy sprite
+    /// set is loaded; 0 until then (marker falls back
+    /// to the enemy's y in that case).
+    pub ef: i32,
+    /// Playing its death animation (action 8/7, see
+    /// `death_action`): still drawn, but takes no more
+    /// hits and deals no damage. `dead` is set only when
+    /// the animation finishes.
+    pub dying: bool,
     pub dead: bool,
     pub attack_hit_done: bool,
     attack_count: usize,
@@ -248,6 +344,9 @@ impl EnemyState {
             action: enemy.action,
             slot,
             health,
+            max_health: enemy.health,
+            ef: 0,
+            dying: false,
             dead: false,
             attack_hit_done: false,
             attack_count: 0,
@@ -256,19 +355,60 @@ impl EnemyState {
         }
     }
 
+    /// Death action from e.java's ek <= 0 handling (first
+    /// hitbox-damage site, the one the sword uses): dQ 1
+    /// (group kind 11) -> i(8), dQ 2/3 (kinds 12/13) ->
+    /// i(7). The ei/eh special case (i(11), a looping
+    /// anim) and the orb drop (b(...)) are NOT ported
+    /// here — see REPORT. Type-3 dR == 17 skips i(7) in
+    /// the original; dR is untraced for our enemies, so
+    /// 7 is used for all kind-13 enemies (documented
+    /// approximation).
+    pub fn death_action(&self) -> usize {
+        match self.enemy.kind {
+            11 => 8,
+            _ => 7,
+        }
+    }
+
+    /// Stagger (flinch) action from e.java's non-lethal
+    /// hit branch: kinds 11/12 -> action 2, kind 13 ->
+    /// action 4 (the no-target-lock, normal-weapon case;
+    /// locked-target variants 7/9/8/13 and the dX
+    /// cooldown gate are NOT ported — see REPORT).
+    /// Measured on set 18432: action 2 = 10 frames,
+    /// repeat 1, ~600 ms; action 4 = 2 frames, repeat 1,
+    /// ~200 ms.
+    pub fn stagger_action(&self) -> usize {
+        match self.enemy.kind {
+            13 => 4,
+            _ => 2,
+        }
+    }
+
     /// Damage from a player hit: `fI[0] << gP` = 2 for the
-    /// first combo step (gG = 0, gP = 0). Returns true if this
-    /// hit killed the enemy. Stagger/death animation not yet
-    /// ported: a dead enemy is simply removed from drawing.
-    pub fn apply_damage(&mut self, amount: i32) -> bool {
-        if self.dead {
+    /// first combo step (gG = 0, gP = 0). Returns true if
+    /// this hit killed the enemy: it starts dying (death
+    /// animation plays, then `dead` is set by `tick`).
+    /// A non-lethal hit starts the stagger action
+    /// (interrupting an attack in progress, as in the
+    /// original); hits on a dying or dead enemy are
+    /// ignored. Facing is left unchanged on stagger
+    /// (documented approximation — the original sets
+    /// `ej` from the player's relative position).
+    pub fn apply_damage(&mut self, anim_set: &anim::AnimSet, amount: i32) -> bool {
+        if self.dead || self.dying {
             return false;
         }
         self.health -= amount;
         if self.health <= 0 {
-            self.dead = true;
+            self.dying = true;
+            self.action = self.death_action();
+            self.slot = anim::AnimSlot::new(anim_set, self.action);
             return true;
         }
+        self.action = self.stagger_action();
+        self.slot = anim::AnimSlot::new(anim_set, self.action);
         false
     }
 
@@ -282,6 +422,30 @@ impl EnemyState {
         player_y: i32,
     ) -> i32 {
         if self.dead {
+            return 0;
+        }
+        // Dying: play the death animation in place (its
+        // root-motion slide is not applied yet — see
+        // REPORT), then mark fully dead when it ends.
+        // No AI, no damage, no further hits.
+        if self.dying {
+            self.slot.advance(anim_set, 40);
+            if self.slot.repeat == 0 {
+                self.dying = false;
+                self.dead = true;
+            }
+            return 0;
+        }
+        // Stagger in progress (actions 2/4 only ever come
+        // from apply_damage in this port): play it in
+        // place — no movement, no attack — then return
+        // to idle when it ends.
+        if self.action == 2 || self.action == 4 {
+            self.slot.advance(anim_set, 40);
+            if self.slot.repeat == 0 {
+                self.action = 0;
+                self.slot = anim::AnimSlot::new(anim_set, 0);
+            }
             return 0;
         }
         // Attack swing in progress: advance, apply its hit once
@@ -367,6 +531,95 @@ impl EnemyState {
         }
         self.x += if self.facing_right { step } else { -step };
         0
+    }
+}
+
+/// Bbox height `ef` (slice 14): the P[3] of the
+/// original's spawn-time `a(set, slot, 0, 0, 0, P)`
+/// call — max(anchor_y + dy + h) minus
+/// min(anchor_y + dy) over the initial action's
+/// timeline-0 composition, transform 0. Returns 0
+/// when the composition is empty or unloadable.
+pub fn enemy_bbox_height(
+    anim_set: &anim::AnimSet,
+    sprite_set: &crate::resources::SpriteSet,
+    action: usize,
+) -> i32 {
+    let Ok(frames) = anim::frames_for_timeline_frame(anim_set, action, 0, 0) else {
+        return 0;
+    };
+    let mut top = i32::MAX;
+    let mut bottom = i32::MIN;
+    for fr in frames {
+        let Some(frame) = sprite_set.frame(fr.sprite_idx) else {
+            continue;
+        };
+        let y0 = fr.dy + frame.anchor_y;
+        top = top.min(y0);
+        bottom = bottom.max(y0 + frame.h);
+    }
+    if bottom == i32::MIN {
+        0
+    } else {
+        bottom - top
+    }
+}
+
+/// Weakened-marker visibility (slice 14), from the
+/// `r(Graphics)` condition for slot 132, with the
+/// port's approximations: no targeting (`ge < 0`
+/// always — grapple/lock not ported), no stagger
+/// cooldown (`dX <= 0` always — dX not ported),
+/// `!eh` always (eh not ported), and the dQ/dR
+/// boss exceptions skipped (dR/dM/dN not ported).
+/// What remains is the health rule itself:
+/// alive and below half max health.
+pub fn weakened_marker_visible(health: i32, max_health: i32, dead: bool, dying: bool) -> bool {
+    !dead && !dying && health >= 0 && health < max_health / 2
+}
+
+/// Draw the weakened markers (slot 132, slice 14):
+/// anim set 1027, action 10, at the marker slot's
+/// current visual, from sprite set 1040 (`aU`),
+/// above each visible enemy at
+/// `y - ef - (ef >> 2)` (the dN `+ (ef >> 3)`
+/// variant is not ported). The marker slot is
+/// advanced once per gameplay tick by the caller
+/// (the original's `t(132)` at the end of the
+/// enemy update), so it pulses through action 10's
+/// 7 timeline frames on a ~1 s cycle.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_weakened_markers(
+    g: &Graphics,
+    fb: &mut Framebuffer,
+    bar_anim: &anim::AnimSet,
+    bar_sprites: &crate::resources::SpriteSet,
+    bar_visual: usize,
+    states: &[EnemyState],
+    cam_x: i32,
+    cam_y: i32,
+) {
+    let Ok(frames) = anim::frames_for_timeline_frame(bar_anim, 10, bar_visual, 0) else {
+        return;
+    };
+    for st in states {
+        if !weakened_marker_visible(st.health, st.max_health, st.dead, st.dying) {
+            continue;
+        }
+        let base_y = st.y - st.ef - (st.ef >> 2);
+        for fr in &frames {
+            if let Some(frame) = bar_sprites.frame(fr.sprite_idx) {
+                draw_sprite_frame(
+                    g,
+                    fb,
+                    &bar_sprites.image,
+                    frame,
+                    st.x + fr.dx - cam_x,
+                    base_y + fr.dy - cam_y,
+                    fr.transform,
+                );
+            }
+        }
     }
 }
 

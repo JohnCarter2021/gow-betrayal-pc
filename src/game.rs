@@ -150,6 +150,11 @@ pub struct Game {
     pub pending_help_about: bool,
     pub gameplay: Option<crate::gameplay::Gameplay>,
     pub held_dir: i32,
+    /// Down held (slice 18): set by the window
+    /// loop from the held ArrowDown key (or by a
+    /// Down press in scripted modes); drives the
+    /// block stance via Gameplay.block_held.
+    pub held_down: bool,
 }
 
 impl Game {
@@ -193,6 +198,7 @@ impl Game {
             pending_help_about: false,
             gameplay: None,
             held_dir: 0,
+            held_down: false,
         }
     }
 
@@ -369,18 +375,85 @@ impl Game {
                 }
             }
             State::Playing => {
+                // A showing level intro dialog captures
+                // input first: Select/Exit dismisses it
+                // and gameplay starts; anything else is
+                // ignored while it shows.
+                if self
+                    .gameplay
+                    .as_ref()
+                    .map(|gp| gp.intro_active())
+                    .unwrap_or(false)
+                {
+                    match input {
+                        Input::Select | Input::Exit => {
+                            if let Some(gp) = &mut self.gameplay {
+                                gp.dismiss_intro();
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                // A showing script dialog captures input:
+                // Select advances the script, Exit cancels
+                // it; the world stays frozen meanwhile.
+                if self
+                    .gameplay
+                    .as_ref()
+                    .map(|gp| gp.script.active())
+                    .unwrap_or(false)
+                {
+                    match input {
+                        Input::Select => {
+                            if let Some(gp) = &mut self.gameplay {
+                                gp.script_advance();
+                            }
+                            self.handle_level_complete();
+                        }
+                        Input::Exit => {
+                            if let Some(gp) = &mut self.gameplay {
+                                gp.script_cancel();
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
                 // Gameplay keys: Left/Right set the held direction and
                 // advance one frame, Attack swings and advances one frame,
-                // Exit returns to the main menu (softkey Menu, not yet
-                // a pause screen in the original either - it opens the
-                // in-game menu, state 102, which is not ported yet).
+                // Up jumps and advances one frame, Select cycles weapons
+                // (left softkey, slice 17), Exit returns to the
+                // main menu (softkey Menu, not yet a pause screen in
+                // the original either - it opens the in-game menu,
+                // state 102, which is not ported yet).
                 match input {
+                    Input::Select => {
+                        if let Some(gp) = &mut self.gameplay {
+                            gp.cycle_weapon();
+                        }
+                    }
+                    Input::Up => {
+                        if let Some(gp) = &mut self.gameplay {
+                            gp.jump();
+                        }
+                        self.gameplay_tick();
+                    }
                     Input::Left => {
                         self.held_dir = -1;
                         self.gameplay_tick();
                     }
                     Input::Right => {
                         self.held_dir = 1;
+                        self.gameplay_tick();
+                    }
+                    Input::Down => {
+                        // Hold-to-block (slice 18):
+                        // sticky in scripted modes
+                        // (no key-release there); the
+                        // live window overwrites
+                        // held_down every frame.
+                        self.held_down = true;
                         self.gameplay_tick();
                     }
                     Input::Attack => {
@@ -472,20 +545,82 @@ impl Game {
         if let Some(level_id) = self.playing_level {
             let arena = self.playing_arena;
             self.gameplay = crate::gameplay::Gameplay::load(&mut self.res, level_id as u32, arena).ok();
+            // Selected-language strings overwrite the
+            // English default loaded by Gameplay::load
+            // (script strings and the intro dialog).
+            // Combo caps/shifts come from the save
+            // (slice 16: gN/gP; slice 17: gO/gQ for
+            // Artemis).
+            if let Some(gp) = &mut self.gameplay {
+                gp.set_strings(self.strings.clone());
+                gp.player.combo_max = self.save.g_n;
+                gp.player.combo_shift = self.save.g_p;
+                gp.player.combo_max_artemis = self.save.g_o;
+                gp.player.combo_shift_artemis = self.save.g_q;
+            }
+        }
+    }
+
+    /// Consume a level-complete flag from gameplay:
+    /// save progress, then load the next level, or
+    /// return to the main menu after the last level.
+    fn handle_level_complete(&mut self) {
+        let next_idx = match &mut self.gameplay {
+            Some(gp) => gp.level_complete.take(),
+            None => None,
+        };
+        let Some(next_idx) = next_idx else {
+            return;
+        };
+        if next_idx < 10 {
+            if self.save.progress < next_idx as i32 {
+                self.save.progress = next_idx as i32;
+            }
+            self.persist_save();
+            self.menu_progress = self.save.progress as usize;
+            self.playing_level = Some(crate::gameplay::LEVEL_IDS[next_idx] as i32);
+            self.playing_arena = false;
+            self.enter_playing();
+        } else {
+            if self.save.progress < 10 {
+                self.save.progress = 10;
+            }
+            self.persist_save();
+            self.menu_progress = self.save.progress as usize;
+            self.gameplay = None;
+            self.state = State::MainMenu;
+            if let Some(menu) = &mut self.menu {
+                menu.apply_progress(self.menu_progress);
+            }
         }
     }
 
     fn gameplay_tick(&mut self) {
         if let Some(gp) = &mut self.gameplay {
             let dir = self.held_dir;
+            gp.block_held = self.held_down;
             gp.tick(&mut self.res, dir, false);
         }
+        self.handle_level_complete();
     }
 
     fn gameplay_tick_attack(&mut self) {
         if let Some(gp) = &mut self.gameplay {
             let dir = self.held_dir;
+            gp.block_held = self.held_down;
             gp.tick(&mut self.res, dir, true);
+        }
+        self.handle_level_complete();
+    }
+
+    /// Live-window jump frame: start the jump, then advance
+    /// one gameplay frame (mirrors the scripted Up handling).
+    pub fn tick_playing_jump(&mut self) {
+        if self.state == State::Playing {
+            if let Some(gp) = &mut self.gameplay {
+                gp.jump();
+            }
+            self.gameplay_tick();
         }
     }
 

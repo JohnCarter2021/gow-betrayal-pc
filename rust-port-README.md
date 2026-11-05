@@ -249,6 +249,141 @@ down, down, Select, Select, and draws the result to
   inert player. Music 1063: 2,422 events, 33,020 ms
   per loop. Sound itself awaits the user's PC (this
   VM has no MIDI synth). `cargo test`: 38/38.
+- Slice 9 DONE (2026-11-04): player jump + gravity in
+  `player.rs`. Up key (grounded only) starts action 24,
+  whose arc is animation root motion (measured: dy 0
+  -> -48 -> +34 over 16 frames, dx 0 -> 77); landing
+  mid-arc snaps to the solid feet row and returns to
+  idle; if the arc finishes without landing, action 26
+  falls with the original gravity (gb += hK, hK += 4
+  every 200 ms, capped at 8) until it lands. Wired to
+  `--play` (up key), `--game` state 1 (Up), and the
+  live window (ArrowUp, queued like Attack).
+  Verified: --play jump ends ga 115, gb 560, idle;
+  `cargo test`: 40/40.
+- Slice 10 DONE (2026-11-04): enemy death animation
+  in `enemies.rs`. Killing blow (ek <= 0 in e.java)
+  starts the death action instead of removing the
+  enemy: kind 11 -> action 8, kinds 12/13 -> action
+  7 (measured on set 18432: 8 = 8 frames ~1.6 s,
+  7 = 12 frames ~0.8 s); dying enemies are still
+  drawn, take no hits and deal no damage, and are
+  removed only when the animation ends. Not yet:
+  the orb/gold drop (b(...)), the ei/eh i(11) case,
+  death root-motion slide, stagger on non-lethal
+  hits. Verified: --play kill shows the fallen pose
+  mid-animation and the enemy gone after it ends;
+  `cargo test`: 40/40.
+- Slice 11 DONE (2026-11-04): enemy stagger on
+  non-lethal hits in `enemies.rs`. A hit that does
+  not kill starts the flinch action (kinds 11/12 ->
+  action 2, ~600 ms; kind 13 -> action 4, ~200 ms,
+  both measured on set 18432, repeat 1); during the
+  flinch the enemy does not move or attack, then
+  returns to idle. Not yet: locked-target stagger
+  variants (7/9/8/13), the dX cooldown gate, facing
+  change on stagger, stagger root-motion slide.
+  Verified: --play single hit leaves enemy 4
+  flinching (action 2) with health 1; `cargo test`:
+  41/41.
+- Slice 12 DONE (2026-11-04): orb/gold drops in
+  `pickups.rs`, wired into gameplay and --play.
+  Death spawns orbs from the enemy's em value
+  (type 0 gold for kinds 11/13, type 2 magic for
+  kind 12; health/magic values shift left 3; split
+  18/9 over 60 else 6/3, big while over 24 remains,
+  max 19 orbs, scatter from one random int each).
+  Orbs home on the player (accel 360/tick, clamp
+  3584, trail of 4), draw from sprite set 1034
+  frame type*4+slot, and collect past 75 ms of age
+  into gold/health/magic (damage orbs home on
+  enemies, though none spawn yet — no magic
+  weapons). Known faithful quirk: an orb parked
+  exactly on the player with ~0 velocity never
+  ages and never collects until a jump breaks
+  overlap. Not yet: level-placed collectibles (the
+  fm/ft system), the gold-full gate (hs untraced).
+  Verified: kill drops 3,3,3,1 = 10 gold (6
+  mid-flight, 10 after a jump breaks the glue);
+  `cargo test`: 46/46.
+- Slice 13 DONE (2026-11-04): script triggers +
+  level-complete flow in `script.rs` + gameplay /
+  game wiring. Type-8 entities are script triggers
+  (tile flag 128, script start m10, length m3);
+  standing on one starts its script: `^` strips
+  its 2-char prefix and shows dialog text, `!`
+  cutscene steps auto-advance (actions not
+  ported), `@` boss-bar triggers are consumed
+  silently, a lone `*` advances the level
+  (progress saved, next level loads, or menu
+  after the last level). Level 1's end script
+  is at tiles (214, 30-33): [^dialog, !, *].
+  Tutorial scripts along the path fire correctly
+  in --play. Not yet: level intro dialog (level
+  header Q, e.g. string 122), state-109
+  interstitial, boss bars, `^` weapon switches.
+  `cargo test`: 52/52. Note: walking to tile 214
+  in --play is blocked at ga=2161 by a tall
+  building wall — climb / box-push mechanics
+  are not ported yet, so the Game-level advance
+  (save + next-level load) is code-reviewed, not
+  end-to-end run; the trigger itself is unit-test
+  verified by teleport.
+- Slice 14 DONE (2026-11-04): weakened-enemy
+  markers (slot 132). Slot 132 = anim set 1027
+  action 10, drawn from sprite set 1040 above
+  enemies below half health (original's
+  `r(Graphics)` condition; `ge`/`dX`/`eh` and the
+  dQ/dR boss exceptions not ported, so the
+  health rule alone decides). The slot advances
+  once per tick (the original's `t(132)`), so the
+  marker pulses through action 10's 7 frames on
+  a ~1 s cycle. Enemy height `ef` = spawn-time
+  bbox height of the initial action's first
+  frame. Boss bar (slot 131) NOT in this slice
+  — it needs the boss system ('@' triggers).
+  `cargo test`: 54/54.
+- Slice 15 DONE (2026-11-04): level intro
+  dialog. Levels with header Q > 0 (only 9217,
+  23552, 27648) open with dialog string Q before
+  gameplay; Q <= 0 goes straight in. The dialog
+  freezes the world; Select/Exit dismisses it.
+  All three intros fit the box (longest 243
+  chars, ~7 lines), so no scrolling. Language
+  changes re-resolve the intro text.
+  `cargo test`: 55/55.
+- Slice 16 DONE (2026-11-04): combat combos
+  + air attacks. Ground combo 54/55/56, then
+  finisher 60; air combo 67/69 (67/68/69 at
+  blade level 3+). Fire during a swing after
+  the 150 ms cancel window buffers the next
+  swing, consumed when the swing ends; no
+  buffer means idle + combo reset. Damage is
+  fI[step] << shift (2/2/4/4 at base level),
+  wired from the save's gN/gP. Air swings use
+  their own root motion and land or fall when
+  they end. `cargo test`: 59/59.
+- Slice 17 DONE (2026-11-05): weapons.
+  Left softkey cycles fM 0/1/2/3 (blades,
+  Artemis, magic, magic); Artemis ground
+  72/73/77 and air 83/84/85 with fJ damage
+  (4/10/10 ground at base level) and fJ*3
+  magic drain per hit; empty magic unequips
+  (A()); `^` script steps with digit > 3
+  switch modes (the combo tutorial forces
+  blades). Magic modes exist but their casts
+  are not ported, so fire does nothing there.
+  `cargo test`: 63/63.
+- Slice 18 DONE (2026-11-05): blocking.
+  Hold Down to block (pose action 3, held
+  by re-starting its 100 ms frame); release
+  to stop. While blocking, enemy hits deal
+  no damage and play the block-impact
+  reaction (action 97, 345 ms, facing the
+  attacker), then the stance resumes while
+  Down stays held. Attacks are ignored
+  while blocking. Live window: hold
+  ArrowDown. `cargo test`: 65/65.
 - Still open: v0.2 (push + tag + Windows zip with
   MSVC audit, when asked).
 
