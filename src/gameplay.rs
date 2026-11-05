@@ -10,6 +10,8 @@
 //! statics + enemies + player + HUD, in `d(Graphics)` order.
 
 use crate::anim::{self, AnimSet};
+use crate::boxes::{self, GameBox};
+use crate::doors::{self, Door, Lever, Switch};
 use crate::enemies::{self, EnemyState};
 use crate::entities::{self, LevelEntities};
 use crate::font::Font;
@@ -72,6 +74,13 @@ pub struct Gameplay {
     /// action 10, advanced once per tick. None when
     /// either set fails to load (markers disabled).
     bar: Option<BarState>,
+    /// Boss bar (Phase 2): anim set 1027, sprite
+    /// set 1040 (`aU`), slot 131. The slot is
+    /// (re)set to the latched action `aT` when an
+    /// `@` trigger latches; it advances (t(131))
+    /// each tick while latched. None when either
+    /// set fails to load (bar disabled).
+    boss_bar: Option<BarState>,
     /// Level intro dialog (slice 15): the level
     /// header's Q string index, when Q > 0 (only
     /// 9217, 23552, 27648 have one). The text is
@@ -85,6 +94,27 @@ pub struct Gameplay {
     /// Game from its held-down state before each
     /// tick; drives the block stance below.
     pub block_held: bool,
+    /// Type-27 boxes (slice 22) and their anim /
+    /// sprite sets (6144 / 6146).
+    pub boxes: Vec<GameBox>,
+    box_anim: AnimSet,
+    box_sprites: SpriteSet,
+    /// Type-9 switches and type-35 doors (slice 23):
+    /// the switch columns toggle doors open/closed.
+    pub switches: Vec<Switch>,
+    pub doors: Vec<Door>,
+    /// Type-34 levers (slice 23): Down near one
+    /// toggles its doors (the (206,32) lever opens
+    /// the pillar door before the level end).
+    pub levers: Vec<Lever>,
+    /// Down held on the previous tick (slice 23):
+    /// a lever pull fires only on the press edge
+    /// (block_held false -> true).
+    prev_block_held: bool,
+    /// Held direction on the previous tick (slice 22):
+    /// a push/pull starts only on a fresh press edge
+    /// (dir != prev_dir) while grabbing.
+    prev_dir: i32,
 }
 
 /// Marker slot state (slice 14).
@@ -98,7 +128,8 @@ impl Gameplay {
     pub fn load(res: &mut Resources, level_id: u32, arena: bool) -> Result<Gameplay, String> {
         let chunk = res.chunk(level_id).map_err(|e| format!("{e:?}"))?;
         let parsed = entities::parse_level_entities(level_id, &chunk).map_err(|e| e.to_string())?;
-        let flags = TileFlags::build(&parsed);
+        let footprints = entities::load_footprints(res, &parsed)?;
+        let flags = TileFlags::build(&parsed, &footprints);
         let player_anim_chunk = res.chunk(28672).map_err(|e| format!("{e:?}"))?;
         let player_anim = anim::load_anim_set(&player_anim_chunk).map_err(|e| e.to_string())?;
         let player_sprites = res.sprite_set(28673, None).map_err(|e| format!("{e:?}"))?;
@@ -110,6 +141,8 @@ impl Gameplay {
         let mut player = Player::new(&player_anim, spawn, parsed.level.facing_right, start_cam_x, start_cam_y);
         player.health = 1024;
         player.max_health = 1024;
+        // Type-3 camera zones (slice 23).
+        player.set_camera_zones(entities::camera_zones(&parsed));
         let mut enemy_states = Vec::new();
         for e in enemies::enemies(&parsed) {
             if let Ok(anim_chunk) = res.chunk(e.anim_id) {
@@ -139,8 +172,50 @@ impl Gameplay {
             }
             _ => None,
         };
-        // Script triggers (type 8): positions are pixels,
-        // tiles are pos/16; extras are (cn, co) pairs.
+        // Boss-bar sets (Phase 2): same anim set
+        // 1027 + sprite set 1040 as the marker, but
+        // slot 131 with the latched action (set on
+        // latch; initialised to action 2).
+        let boss_bar = match (
+            res.chunk(1027).ok().and_then(|c| anim::load_anim_set(&c).ok()),
+            res.sprite_set(1040, None).ok(),
+        ) {
+            (Some(anim_set), Some(sprites)) => {
+                let slot = crate::anim::AnimSlot::new(&anim_set, 2);
+                Some(BarState {
+                    anim: anim_set,
+                    sprites,
+                    slot,
+                })
+            }
+            _ => None,
+        };
+        // Type-27 boxes (slice 22): anim set 6144 +
+        // sprite set 6146 with the level palette key
+        // (6150 + bG[i]).
+        let level_idx = level_index(level_id);
+        let box_anim_chunk = res.chunk(boxes::BOX_ANIM_SET).map_err(|e| format!("{e:?}"))?;
+        let box_anim = anim::load_anim_set(&box_anim_chunk).map_err(|e| e.to_string())?;
+        let box_sprites = res
+            .sprite_set(
+                boxes::BOX_SPRITE_SET,
+                palette_key(boxes::BOX_SPRITE_KEY_BASE, level_idx),
+            )
+            .map_err(|e| format!("{e:?}"))?;
+        let boxes = boxes::load_boxes(
+            res,
+            &parsed,
+            palette_key(boxes::BOX_SPRITE_KEY_BASE, level_idx),
+        )?;
+        // Type-9 switches and type-35 doors (slice 23).
+        let switches = doors::load_switches(&parsed);
+        let doors = doors::load_doors(
+            res,
+            &parsed,
+            palette_key(2062, level_idx),
+        )?;
+        // Type-34 levers (slice 23).
+        let levers = doors::load_levers(&parsed);
         let mut triggers = Vec::new();
         if let Some(g8) = parsed.group(8) {
             for (i, &(px, py)) in g8.positions.iter().enumerate() {
@@ -192,9 +267,18 @@ impl Gameplay {
             script: ScriptEngine::new(triggers, strings),
             level_complete: None,
             bar,
+            boss_bar,
             intro_index,
             intro_text,
             block_held: false,
+            boxes,
+            box_anim,
+            box_sprites,
+            switches,
+            doors,
+            levers,
+            prev_block_held: false,
+            prev_dir: 0,
         })
     }
 
@@ -273,7 +357,13 @@ impl Gameplay {
 
     /// Start a jump (Up key) if the player is grounded.
     /// The caller advances a frame afterwards, as for walk.
+    /// Up pressed (slice 21): while holding on a wall
+    /// (action 33) it climbs up one cycle; otherwise
+    /// it jumps (or double-jumps, slice 19).
     pub fn jump(&mut self) -> bool {
+        if self.player.action == 33 {
+            return self.player.climb_up(&self.player_anim, &self.flags);
+        }
         self.player.jump(&self.player_anim)
     }
 
@@ -299,6 +389,38 @@ impl Gameplay {
         self.player.cycle_weapon()
     }
 
+    /// Start a box push/pull (slice 22): the player is
+    /// grabbing (21) and pressed Left/Right. Pressing
+    /// the facing direction pushes (22, gl = 1),
+    /// pressing the opposite pulls (23, gl = 0). `u()`
+    /// runs at once; on failure the player returns to
+    /// the grab pose.
+    fn start_box_push(&mut self, dir: i32) {
+        let Some(gd) = self.player.grabbed_box else {
+            return;
+        };
+        let push = (dir > 0) == self.player.facing_right;
+        let action = if push { 22 } else { 23 };
+        self.player.push_pull = if push { 1 } else { 0 };
+        self.player.action = action;
+        self.player.slot = anim::AnimSlot::new(&self.player_anim, action);
+        let (gw, gx) = (self.player.tile_x(), self.player.walk_tile_y());
+        let facing = self.player.facing_right;
+        if !boxes::try_push(
+            &mut self.boxes,
+            gd,
+            &mut self.flags,
+            facing,
+            action,
+            gw,
+            gx,
+            &self.box_anim,
+        ) {
+            self.player.action = 21;
+            self.player.slot = anim::AnimSlot::new(&self.player_anim, 21);
+        }
+    }
+
     /// Cancel the active script (Exit key).
     pub fn script_cancel(&mut self) {
         self.script.cancel();
@@ -307,6 +429,16 @@ impl Gameplay {
     fn handle_script_event(&mut self, ev: ScriptEvent) {
         if ev == ScriptEvent::LevelComplete {
             self.level_complete = Some(self.level_index + 1);
+        }
+        if ev == ScriptEvent::BossBarLatched {
+            // Phase 2: an `@` trigger latched — (re)set
+            // the boss-bar slot (131) to the latched
+            // action `aT` (fresh slot, like `a(131,
+            // 1027, aT)`).
+            if let Some(bb) = &mut self.boss_bar {
+                let action = self.script.boss_action();
+                bb.slot = crate::anim::AnimSlot::new(&bb.anim, action as usize);
+            }
         }
     }
 
@@ -324,18 +456,52 @@ impl Gameplay {
         if self.script.active() {
             return;
         }
+        // Climb turn (slice 21): Left/Right pressed
+        // opposite to the facing while holding (33)
+        // flips the player around the wall (44).
+        if self.player.action == 33 && dir != 0 {
+            self.player.climb_turn(&self.player_anim, dir);
+        }
         // Block stance (slice 18): Down held starts
         // it from idle/walk (or resumes it after a
         // blocked-hit reaction ends in idle);
         // releasing Down ends it. Attacking or
         // airborne presses do not start it.
+        // Down held while holding on a wall (slice
+        // 21) climbs down (34) or drops (26) instead.
         if self.block_held {
-            if !self.player.blocking || self.player.action == 0 {
+            // Lever pull (slice 23): Down pressed near
+            // a type-34 lever toggles its doors. Fires
+            // only on the press edge, while grounded.
+            let down_edge = !self.prev_block_held;
+            if down_edge && (self.player.action == 0 || self.player.action == 9) {
+                if let Some(lx) = doors::check_lever(
+                    &mut self.levers,
+                    &mut self.doors,
+                    &mut self.flags,
+                    self.player.ga,
+                    self.player.gb,
+                ) {
+                    self.player.ga = lx;
+                }
+            }
+            if self.player.action == 37 {
+                // Drop from a ledge hang (slice 23):
+                // Down while hanging (37) lets go (26).
+                self.player.drop_from_hang(&self.player_anim);
+            } else if self.player.action == 33 {
+                self.player.climb_down(&self.player_anim, &self.flags);
+            } else if self.player.drop_through(&self.player_anim, &self.flags) {
+                // Drop through a one-way platform
+                // (slice 23): Down on a flag-8192 tile
+                // falls through instead of blocking.
+            } else if !self.player.blocking || self.player.action == 0 {
                 self.player.start_block(&self.player_anim);
             }
         } else if self.player.blocking {
             self.player.stop_block(&self.player_anim);
         }
+        self.prev_block_held = self.block_held;
         if attack && !self.player.blocking {
             // `A()` (slice 17): Artemis with no magic
             // left unequips instead of swinging.
@@ -435,7 +601,38 @@ impl Gameplay {
         }
         let w = self.parsed.level.pixel_width() as i32;
         let h = self.parsed.level.pixel_height() as i32;
+        // Box push/pull start (slice 22): a fresh
+        // Left/Right press while grabbing (21) starts
+        // the push (22, facing direction) or pull (23,
+        // opposite) and runs u() at once; failure
+        // returns to the grab pose. Only when the grab
+        // was already held before this tick — a press
+        // that walks the player into the box does not
+        // also push it.
+        let was_grabbing = self.player.action == 21;
+        if was_grabbing && dir != 0 && dir != self.prev_dir {
+            self.start_box_push(dir);
+        }
+        self.prev_dir = dir;
         self.player.tick(&self.player_anim, &self.flags, w, h, dir);
+        // Box slots + slide (the original's per-frame
+        // box update); the grab check runs after the
+        // player tick, when the walk has stopped at
+        // the box face.
+        for b in &mut self.boxes {
+            b.advance(&self.box_anim);
+        }
+        boxes::check_grab(&self.boxes, &self.flags, &mut self.player, &self.player_anim, dir);
+        // Type-9 switch (slice 23): standing on a
+        // flag-256 tile toggles the matching doors.
+        // The player's tile is (tile_x, gb/16).
+        doors::check_switch(
+            &self.switches,
+            &mut self.doors,
+            &mut self.flags,
+            self.player.tile_x(),
+            self.player.gb / 16,
+        );
         // Pickups home on the player's new position.
         let enemy_pos: Vec<(i32, i32, bool)> = self
             .enemy_states
@@ -451,6 +648,15 @@ impl Gameplay {
         if let Some(bar) = &mut self.bar {
             let BarState { anim, slot, .. } = bar;
             slot.advance(anim, 40);
+        }
+        // Boss-bar pulse (Phase 2, `t(131)`): the
+        // slot advances each tick while the `@`
+        // latch holds.
+        if self.script.boss_latched() {
+            if let Some(bb) = &mut self.boss_bar {
+                let BarState { anim, slot, .. } = bb;
+                slot.advance(anim, 40);
+            }
         }
         // Script trigger check (z()): the player's
         // tile, after movement. Arena scripts are not
@@ -488,6 +694,12 @@ impl Gameplay {
                     }
                 }
             }
+        }
+        // Boxes (slice 22): drawn after the statics,
+        // before the enemies, at their px position
+        // with their slot's current frame.
+        for b in &self.boxes {
+            b.draw(&g, fb, &self.box_anim, &self.box_sprites, self.player.cam_x, self.player.cam_y);
         }
         let _ = enemies::draw_enemy_states(&g, fb, res, &self.enemy_states, self.player.cam_x, self.player.cam_y);
         // Weakened markers above damaged enemies.
@@ -533,6 +745,45 @@ impl Gameplay {
             combo_hits: self.combo_hits,
         };
         hud::draw_hud(&g, fb, res, font, &hud_state);
+        // Boss bar (Phase 2, `d(Graphics)` state 100):
+        // drawn at screen (12, F - 25) = (12, 295)
+        // when the `@` latch holds, the player's
+        // facing `hu` equals `aS`, and the player is
+        // inside the viewport (`e.a(ga, gb, iQ, iR,
+        // E, F)`). The `!fR` grapple guard is vacuous
+        // here (grapple is not ported). The bar is a
+        // HUD element: screen coordinates, not
+        // camera-translated.
+        if self.script.boss_latched()
+            && self.script.boss_facing_right() == self.player.facing_right
+            && self.player.ga >= self.player.cam_x
+            && self.player.ga < self.player.cam_x + 240
+            && self.player.gb >= self.player.cam_y
+            && self.player.gb < self.player.cam_y + 320
+        {
+            if let Some(bb) = &self.boss_bar {
+                if let Ok(frames) = anim::frames_for_timeline_frame(
+                    &bb.anim,
+                    self.script.boss_action() as usize,
+                    bb.slot.visual,
+                    0,
+                ) {
+                    for fr in frames {
+                        if let Some(frame) = bb.sprites.frame(fr.sprite_idx) {
+                            midp::draw_sprite_frame(
+                                &g,
+                                fb,
+                                &bb.sprites.image,
+                                frame,
+                                12 + fr.dx,
+                                295 + fr.dy,
+                                fr.transform,
+                            );
+                        }
+                    }
+                }
+            }
+        }
         // Script dialog on top (audio-prompt box
         // geometry; original script-dialog box args
         // are untraced, see script.rs).
@@ -620,6 +871,76 @@ mod tests {
         drain_script(gp);
     }
 
+    /// Phase 2: the boss bar latches on an `@`
+    /// trigger, animates while latched, and clears
+    /// when the player leaves the trigger tiles.
+    /// Teleports to the `@21` wall-face trigger at
+    /// tile (135, 28) in level 9217.
+    #[test]
+    fn boss_bar_latches_and_animates() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        assert!(gp.boss_bar.is_some(), "boss-bar sets load");
+        assert!(!gp.script.boss_latched());
+        // Teleport onto the `@21` wall-face tile,
+        // facing right (aS=true for `@21`).
+        gp.player.ga = 135 * 16;
+        gp.player.gb = 28 * 16;
+        gp.player.facing_right = true;
+        t(&mut gp, &mut res, 0, false);
+        assert!(gp.script.boss_latched());
+        assert_eq!(gp.script.boss_action(), 2, "aT = 1st digit of `@21`");
+        assert!(gp.script.boss_facing_right(), "aS = 2nd digit '1'");
+        // The slot is (re)set to action 2 on latch.
+        let bb = gp.boss_bar.as_ref().unwrap();
+        assert_eq!(bb.slot.action, 2);
+        // The bar animates (t(131)) while latched:
+        // action 2 is a 2-frame loop (t0 200 ms,
+        // t1 100 ms), so after 6 ticks (240 ms) the
+        // visual has moved from frame 0 to frame 1.
+        let v0 = bb.slot.visual;
+        assert_eq!(v0, 0, "action 2 starts on timeline frame 0");
+        for _ in 0..6 {
+            t(&mut gp, &mut res, 0, false);
+        }
+        assert!(gp.script.boss_latched(), "still on the trigger tile");
+        let v1 = gp.boss_bar.as_ref().unwrap().slot.visual;
+        assert_eq!(v1, 1, "boss-bar slot advances to frame 1 after 240 ms");
+        // Draw the latched bar: smoke test (no
+        // panic) and the bar changes pixels in its
+        // screen band (y 270-300, x 0-80). The
+        // camera lags a teleport, so snap it to
+        // the player first — otherwise the
+        // viewport guard (`e.a(ga, gb, iQ, iR, E,
+        // F)`) correctly hides the bar.
+        gp.player.cam_x = gp.player.ga - 120;
+        gp.player.cam_y = gp.player.gb - 160;
+        let mut fb = crate::midp::Framebuffer::new(240, 320);
+        let font_set = res.sprite_set(1031, None).expect("font 1031");
+        let font = crate::font::Font::from_sprite_set(font_set);
+        gp.draw(&mut fb, &mut res, &font);
+        // Same scene, same camera, player turned
+        // away (aS=true needs facing right): the
+        // bar hides. The band is fully opaque
+        // ground, so compare pixel values, not
+        // non-zero counts.
+        gp.player.facing_right = false;
+        let mut fb2 = crate::midp::Framebuffer::new(240, 320);
+        gp.draw(&mut fb2, &mut res, &font);
+        let changed = (270..300)
+            .flat_map(|y| (0..80).map(move |x| (x, y)))
+            .filter(|&(x, y)| fb.pixels[y * 240 + x] != fb2.pixels[y * 240 + x])
+            .count();
+        assert!(changed > 0, "latched bar changes pixels in its screen band");
+        // Step off the trigger tiles: latch clears.
+        gp.player.ga = 100 * 16;
+        gp.player.gb = 35 * 16;
+        gp.player.facing_right = true;
+        t(&mut gp, &mut res, 0, false);
+        assert!(!gp.script.boss_latched());
+    }
+
     #[test]
     fn gameplay_load_and_walk() {
         let mut res = crate::resources::Resources::new("../extracted");
@@ -632,6 +953,73 @@ mod tests {
         gp.tick(&mut res, 1, false);
         assert!(gp.player.ga >= 48);
         assert_eq!(gp.player.cam_x, 0);
+    }
+
+    /// Slice 21, Gameplay routing: Up double-jumps
+    /// onto the climb column (tile 156) and attaches;
+    /// a further Up climbs (35); Down held climbs
+    /// down (34). Teleports to the temple floor.
+    #[test]
+    fn gameplay_climb_attach_up_down() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        gp.player.ga = 2440;
+        gp.player.gb = 528;
+        gp.player.facing_right = true;
+        assert!(gp.jump(), "first jump must start");
+        for _ in 0..12 {
+            t(&mut gp, &mut res, 1, false);
+        }
+        assert_eq!(gp.player.action, 24);
+        assert!(gp.jump(), "double jump must start");
+        let mut attached = false;
+        for _ in 0..60 {
+            t(&mut gp, &mut res, 1, false);
+            if gp.player.action == 33 {
+                attached = true;
+                break;
+            }
+        }
+        assert!(attached, "never attached: action {}", gp.player.action);
+        assert_eq!(gp.player.ga, 156 * 16 - 10);
+        // Up while holding climbs one cycle (-19 px).
+        let start_gb = gp.player.gb;
+        assert!(gp.jump(), "climb-up refused");
+        assert_eq!(gp.player.action, 35);
+        let mut held = false;
+        for _ in 0..30 {
+            t(&mut gp, &mut res, 0, false);
+            if gp.player.action == 33 {
+                held = true;
+                break;
+            }
+        }
+        assert!(held, "climb-up never held: action {}", gp.player.action);
+        assert_eq!(gp.player.gb, start_gb - 19);
+        // Down held climbs down one cycle (+20 px).
+        gp.block_held = true;
+        let start_gb = gp.player.gb;
+        let mut down = false;
+        for _ in 0..30 {
+            t(&mut gp, &mut res, 0, false);
+            if gp.player.action == 34 {
+                down = true;
+                break;
+            }
+        }
+        assert!(down, "Down held never started climb-down: action {}", gp.player.action);
+        let mut held = false;
+        for _ in 0..30 {
+            t(&mut gp, &mut res, 0, false);
+            if gp.player.action == 33 {
+                held = true;
+                break;
+            }
+        }
+        assert!(held, "climb-down never held: action {}", gp.player.action);
+        assert_eq!(gp.player.gb, start_gb + 20);
+        gp.block_held = false;
     }
 
     #[test]
@@ -1040,6 +1428,213 @@ mod tests {
         let gp4 = super::Gameplay::load(&mut res, 27648, false).unwrap();
         assert!(gp4.intro_active());
     }
+
+    /// Slice 22, Gameplay routing: walk right into the
+    /// box at tile 128 (grab 21), release, fresh press
+    /// right pushes it 2 tiles (eQ 130), and the box
+    /// slides to its new tile while the player idles
+    /// (a 2-tile push leaves it out of reach).
+    /// Slice 23: the wall crossing in Gameplay — push
+    /// the crate to the wall, jump onto it, double jump
+    /// to the roof ledge, and mount onto the roof
+    /// (past the ga=2161 wall). The roof-to-temple-
+    /// floor route past the hanging pillar is a
+    /// level-navigation detail (double-jump onto the
+    /// row-20 structure, then drop); the level-end
+    /// flow is verified separately below.
+    #[test]
+    /// Slice 23: the temple-floor run to the level
+    /// end. From the temple floor (3200,528), walk
+    /// right to the lever at tile (206,32); Down
+    /// pulls it, opening the pillar door (cS=6) at
+    /// (213,32); then walk through to the level-end
+    /// trigger at tile 214 (cn=175) and
+    /// `level_complete` is set.
+    #[test]
+    fn gameplay_temple_floor_to_level_end() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        // Teleport to the temple floor, facing right.
+        gp.player.ga = 3200;
+        gp.player.gb = 528;
+        gp.player.facing_right = true;
+        gp.player.action = 0;
+        gp.player.slot = crate::anim::AnimSlot::new(&gp.player_anim, 0);
+        let mut ticks = 0;
+        let mut pulled = false;
+        // Walk right to the lever (206,32) at
+        // ga=3296; press Down there (one tick with
+        // block_held) to pull it, then keep walking.
+        while ticks < 400 && gp.level_complete.is_none() {
+            ticks += 1;
+            if !pulled && gp.player.ga >= 206 * 16 {
+                pulled = true;
+                gp.block_held = true;
+                gp.tick(&mut res, 0, false);
+                gp.block_held = false;
+                continue;
+            }
+            gp.tick(&mut res, 1, false);
+            // Drain any script dialog that fires.
+            while gp.script.active() {
+                gp.script_advance();
+            }
+        }
+        assert!(pulled, "the lever pull should have fired");
+        assert!(gp.doors.iter().find(|d| d.id == 6).map(|d| d.open).unwrap_or(false), "pillar door should be open");
+        assert!(gp.level_complete.is_some(), "level should complete; ga={} gb={} action={}", gp.player.ga, gp.player.gb, gp.player.action);
+        assert_eq!(gp.level_complete, Some(1), "next level index 1");
+    }
+
+    fn gameplay_wall_crossing_mounts_roof() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        gp.player.ga = 1900;
+        gp.player.gb = 560;
+        gp.player.facing_right = true;
+        // Walk to the crate and grab it.
+        for _ in 0..60 {
+            t(&mut gp, &mut res, 1, false);
+            if gp.player.action == 21 {
+                break;
+            }
+        }
+        assert_eq!(gp.player.action, 21, "never grabbed the crate");
+        // Push it to the wall (128 -> 130 -> 132 -> 134):
+        // after each push the player idles out of reach,
+        // so walk back to the crate and grab it again.
+        for want in [130, 132, 134] {
+            t(&mut gp, &mut res, 0, false);
+            t(&mut gp, &mut res, 1, false);
+            assert_eq!(gp.player.action, 22, "push to {} never started", want);
+            assert_eq!(gp.boxes[1].e_q, want, "box eQ {}", gp.boxes[1].e_q);
+            for _ in 0..60 {
+                t(&mut gp, &mut res, 0, false);
+                if gp.player.action == 0 && gp.boxes[1].x == want * 16 {
+                    break;
+                }
+            }
+            assert_eq!(gp.boxes[1].x, want * 16, "box never slid to {}", want);
+            if want == 134 {
+                break;
+            }
+            // Walk back to the crate and grab it again.
+            let mut grabbed = false;
+            for _ in 0..60 {
+                t(&mut gp, &mut res, 1, false);
+                if gp.player.action == 21 {
+                    grabbed = true;
+                    break;
+                }
+            }
+            assert!(grabbed, "never re-grabbed for push to {}", want + 2);
+        }
+        // Jump out of the grab onto the crate top.
+        // After the last push the player idles out of
+        // reach, so walk back and grab the crate again.
+        let mut grabbed = false;
+        for _ in 0..60 {
+            t(&mut gp, &mut res, 1, false);
+            if gp.player.action == 21 {
+                grabbed = true;
+                break;
+            }
+        }
+        assert!(grabbed, "never re-grabbed the crate at the wall: ga={} action={}", gp.player.ga, gp.player.action);
+        gp.jump();
+        let mut on_box = false;
+        for _ in 0..40 {
+            t(&mut gp, &mut res, 1, false);
+            if gp.player.action == 0 && gp.player.gb == 528 {
+                on_box = true;
+                break;
+            }
+        }
+        assert!(on_box, "never landed on the crate: ga={} gb={} action={}", gp.player.ga, gp.player.gb, gp.player.action);
+        // Double jump from the crate top to the roof ledge.
+        gp.jump();
+        for _ in 0..12 {
+            t(&mut gp, &mut res, 1, false);
+        }
+        gp.jump();
+        let mut hung = false;
+        for _ in 0..60 {
+            t(&mut gp, &mut res, 1, false);
+            if gp.player.action == 37 {
+                hung = true;
+                break;
+            }
+        }
+        assert!(hung, "never grabbed the roof ledge: ga={} gb={} action={}", gp.player.ga, gp.player.gb, gp.player.action);
+        assert_eq!(gp.player.gb, 26 * 16 + crate::player::PLAYER_GD);
+        // Mount onto the roof.
+        gp.jump();
+        assert_eq!(gp.player.action, 38, "mount never started: {}", gp.player.action);
+        for _ in 0..40 {
+            t(&mut gp, &mut res, 0, false);
+            if gp.player.action == 0 {
+                break;
+            }
+        }
+        assert_eq!(gp.player.action, 0, "mount never finished");
+        assert_eq!(gp.player.gb, 26 * 16, "not on the roof: gb={}", gp.player.gb);
+        assert!(gp.player.ga > 136 * 16, "not past the wall: ga={}", gp.player.ga);
+    }
+
+    #[test]
+    fn gameplay_box_grab_push() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        gp.player.ga = 1900;
+        gp.player.gb = 560;
+        gp.player.facing_right = true;
+        let mut grabbed = false;
+        for _ in 0..60 {
+            t(&mut gp, &mut res, 1, false);
+            if gp.player.action == 21 {
+                grabbed = true;
+                break;
+            }
+        }
+        assert!(
+            grabbed,
+            "never grabbed: ga {} action {}",
+            gp.player.ga, gp.player.action
+        );
+        assert_eq!(gp.player.grabbed_box, Some(1), "the crate is item 1");
+        assert_eq!(gp.boxes[1].e_q, 128);
+        // Release the direction (so the next press is
+        // a fresh edge), then press right to push.
+        t(&mut gp, &mut res, 0, false);
+        assert_eq!(gp.player.action, 21, "grab must hold through the release");
+        t(&mut gp, &mut res, 1, false);
+        assert_eq!(
+            gp.player.action, 22,
+            "fresh press pushes: action {}",
+            gp.player.action
+        );
+        assert_eq!(gp.boxes[1].e_q, 130, "push moves 2 tiles: eQ {}", gp.boxes[1].e_q);
+        // The push plays out (~25 ticks); the box
+        // slides to its new tile (its action runs a
+        // tick longer than the player's push) and the
+        // player idles (a 2-tile push leaves the box
+        // out of reach).
+        for _ in 0..60 {
+            t(&mut gp, &mut res, 0, false);
+            if gp.player.action == 0 && gp.boxes[1].x == 130 * 16 {
+                break;
+            }
+        }
+        assert_eq!(
+            gp.player.action, 0,
+            "after the push the player idles: {}",
+            gp.player.action
+        );
+        assert_eq!(gp.boxes[1].x, 130 * 16, "box slid to its new tile: {}", gp.boxes[1].x);
+    }
 }
 
 #[cfg(test)]
@@ -1067,6 +1662,7 @@ mod level_tests {
         assert_eq!(super::level_index(9216), 0); // Arena: no bB entry, index 0
     }
 }
+
 
 
 

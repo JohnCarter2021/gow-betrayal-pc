@@ -22,7 +22,14 @@
 //!   string, and a `*` there advances the level
 //!   (`++bC`, `bD` update, `bA = bB[bC]`, state 109).
 //! - A trigger whose first string starts with `@` sets
-//!   the boss-bar latch (`aR`) instead of a dialog.
+//!   the boss-bar latch (`aR`) instead of a dialog
+//!   (Phase 2): `aT` = 1st digit (slot-131 action in
+//!   anim set 1027), `aS` = 2nd digit == '1' (the bar
+//!   shows when the player's facing `hu` equals `aS`).
+//!   The original does NOT clear flag 128 for `@`
+//!   triggers, so the latch is positional: it sets on
+//!   the false -> true edge and clears when the player
+//!   leaves every trigger tile.
 //!
 //! Port approximations (documented, not silent):
 //! - `!` cutscene steps auto-advance: the type-6 action
@@ -32,8 +39,16 @@
 //! - `^` weapon/magic switches are not applied (no
 //!   weapons in the port yet); the text after the
 //!   2-char `^` + digit prefix is shown as dialog.
-//! - `@` triggers are consumed with no visible effect
-//!   (boss bars are not ported; see slice 14).
+//! - `@` triggers latch the boss bar (Phase 2, slot
+//!   131, anim set 1027, drawn at screen (12, 295)
+//!   while latched and facing the right way). The bar
+//!   is a looping 2-frame animation (actions 2/6/8),
+//!   not a damage-driven health bar — it appears and
+//!   pulses while the latch holds and disappears when
+//!   the player leaves the trigger tiles or turns
+//!   away. The grapple bar (same slot 131, `fR`) is
+//!   a separate button-mashing mechanic and is not
+//!   ported (grapple itself is not ported).
 //! - Level advance skips the original's state-109
 //!   interstitial (Select -> 106, Exit -> menu): the
 //!   next level loads immediately, or the main menu
@@ -64,6 +79,10 @@ pub enum ScriptEvent {
     Ended,
     /// A lone `*` was reached: advance the level.
     LevelComplete,
+    /// An `@` trigger latched the boss bar
+    /// (slice 23 / Phase 2): the caller should
+    /// (re)set the boss-bar slot to the action.
+    BossBarLatched,
     /// Nothing is showing (no active script).
     None,
 }
@@ -87,6 +106,16 @@ pub struct ScriptEngine {
     /// magic). Taken by the caller after the step
     /// shows; None when no switch is pending.
     pending_weapon: Option<i32>,
+    /// Boss-bar latch (Phase 2, `aR`/`aS`/`aT`):
+    /// true while the player stands on an `@`
+    /// trigger tile. `boss_facing_right` is `aS`
+    /// (the 2nd `@` digit == '1': the bar shows
+    /// when the player faces that way);
+    /// `boss_action` is `aT` (the 1st digit: the
+    /// slot-131 action in anim set 1027).
+    boss_latched: bool,
+    boss_facing_right: bool,
+    boss_action: i32,
 }
 
 impl ScriptEngine {
@@ -97,7 +126,30 @@ impl ScriptEngine {
             active: None,
             dialog_text: None,
             pending_weapon: None,
+            boss_latched: false,
+            boss_facing_right: false,
+            boss_action: -1,
         }
+    }
+
+    /// All script triggers (tile, start, len), for
+    /// tests and debugging.
+    pub fn triggers(&self) -> &[ScriptTrigger] {
+        &self.triggers
+    }
+
+    /// Boss-bar latch state (Phase 2): whether the
+    /// `@` latch is active, which way the player
+    /// must face for the bar to show, and the
+    /// slot-131 action.
+    pub fn boss_latched(&self) -> bool {
+        self.boss_latched
+    }    pub fn boss_facing_right(&self) -> bool {
+        self.boss_facing_right
+    }
+
+    pub fn boss_action(&self) -> i32 {
+        self.boss_action
     }
 
     /// Take a weapon switch recorded by the most
@@ -120,7 +172,8 @@ impl ScriptEngine {
 
     /// Fire the trigger on this tile, if any. Returns
     /// the first script event (dialog, level-complete
-    /// for a lone-`*` script, or none for `@` triggers).
+    /// for a lone-`*` script, boss-bar latch for a
+    /// newly latched `@` trigger, or none).
     pub fn check_trigger(&mut self, tile_x: i32, tile_y: i32) -> ScriptEvent {
         if self.active.is_some() {
             return ScriptEvent::None;
@@ -131,17 +184,36 @@ impl ScriptEngine {
             .find(|t| t.tile_x == tile_x && t.tile_y == tile_y)
             .copied()
         else {
+            // Not on any trigger tile: the `@` latch
+            // clears (the original's outer else sets
+            // `aR = false`).
+            self.boss_latched = false;
             return ScriptEvent::None;
         };
+        let first = self.strings.get(t.start).cloned().unwrap_or_default();
+        if first.starts_with('@') {
+            // Boss-bar latch (Phase 2): the original
+            // does NOT clear flag 128 for `@` triggers,
+            // so the trigger stays and the latch is
+            // positional. Only the false -> true edge
+            // (re)sets the slot (action aT); while
+            // latched, the caller advances the slot
+            // (t(131)) each tick.
+            if !self.boss_latched {
+                let chars: Vec<char> = first.chars().collect();
+                let a_t = chars.get(1).and_then(|c| c.to_digit(10)).unwrap_or(0) as i32;
+                let a_s = chars.get(2).and_then(|c| c.to_digit(10)).unwrap_or(0) == 1;
+                self.boss_latched = true;
+                self.boss_facing_right = a_s;
+                self.boss_action = a_t;
+                return ScriptEvent::BossBarLatched;
+            }
+            return ScriptEvent::None;
+        }
         // Fire once: drop every trigger sharing cn,
         // like the original's c(cl, cm, 128) loop.
         let start = t.start;
         self.triggers.retain(|o| o.start != start);
-        let first = self.strings.get(start).cloned().unwrap_or_default();
-        if first.starts_with('@') {
-            // Boss-bar latch: consumed, no dialog.
-            return ScriptEvent::None;
-        }
         self.active = Some(ActiveScript {
             current: start,
             end: start + t.len,
@@ -234,6 +306,60 @@ mod tests {
             triggers,
             strings.into_iter().map(|s| s.to_string()).collect(),
         )
+    }
+
+    /// Phase 2: an `@` trigger latches the boss bar
+    /// (aT = 1st digit, aS = 2nd digit == '1') on the
+    /// false -> true edge, stays latched while the
+    /// player is on the trigger tile (the trigger is
+    /// NOT consumed), and clears when the player
+    /// leaves every trigger tile.
+    #[test]
+    fn at_trigger_latches_boss_bar() {
+        let mut e = engine(
+            vec![ScriptTrigger {
+                tile_x: 5,
+                tile_y: 6,
+                start: 0,
+                len: 1,
+            }],
+            vec!["@21"],
+        );
+        assert!(!e.boss_latched());
+        // Step on the `@` tile: latch fires.
+        assert_eq!(e.check_trigger(5, 6), ScriptEvent::BossBarLatched);
+        assert!(e.boss_latched());
+        assert_eq!(e.boss_action(), 2, "aT = 1st digit");
+        assert!(e.boss_facing_right(), "aS = 2nd digit == '1'");
+        // Still on the tile: no re-latch, trigger stays.
+        assert_eq!(e.check_trigger(5, 6), ScriptEvent::None);
+        assert!(e.boss_latched());
+        // Step off every trigger tile: latch clears.
+        assert_eq!(e.check_trigger(0, 0), ScriptEvent::None);
+        assert!(!e.boss_latched());
+        // Step back on: latches again (trigger kept).
+        assert_eq!(e.check_trigger(5, 6), ScriptEvent::BossBarLatched);
+        assert!(e.boss_latched());
+    }
+
+    /// Phase 2: `@60` latches with aT=6, aS=false
+    /// (bar shows facing left). (In 9217 all three
+    /// `@` strings end in '1', so aS is true there;
+    /// this pins the digit rule with a '0'.)
+    #[test]
+    fn at_trigger_second_digit_zero_means_facing_left() {
+        let mut e = engine(
+            vec![ScriptTrigger {
+                tile_x: 1,
+                tile_y: 1,
+                start: 0,
+                len: 1,
+            }],
+            vec!["@60"],
+        );
+        assert_eq!(e.check_trigger(1, 1), ScriptEvent::BossBarLatched);
+        assert_eq!(e.boss_action(), 6);
+        assert!(!e.boss_facing_right(), "aS = 2nd digit '0' is false");
     }
 
     #[test]
@@ -339,7 +465,11 @@ mod tests {
     }
 
     #[test]
-    fn at_trigger_consumes_without_dialog() {
+    fn at_trigger_latches_without_dialog() {
+        // Phase 2 (supersedes the old consume
+        // behaviour): an `@` trigger latches the
+        // boss bar, shows no dialog, and is NOT
+        // consumed — it stays and re-latches.
         let mut e = engine(
             vec![ScriptTrigger {
                 tile_x: 3,
@@ -347,12 +477,15 @@ mod tests {
                 start: 0,
                 len: 1,
             }],
-            vec!["@boss"],
+            vec!["@21"],
         );
+        assert_eq!(e.check_trigger(3, 4), ScriptEvent::BossBarLatched);
+        assert!(!e.active());
+        assert!(e.boss_latched());
+        // Still on the tile: no re-latch, no dialog.
         assert_eq!(e.check_trigger(3, 4), ScriptEvent::None);
         assert!(!e.active());
-        // Consumed: firing again finds nothing.
-        assert_eq!(e.check_trigger(3, 4), ScriptEvent::None);
+        assert!(e.boss_latched());
     }
 
     #[test]

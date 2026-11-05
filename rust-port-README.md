@@ -313,15 +313,17 @@ down, down, Select, Select, and draws the result to
   standing on one starts its script: `^` strips
   its 2-char prefix and shows dialog text, `!`
   cutscene steps auto-advance (actions not
-  ported), `@` boss-bar triggers are consumed
-  silently, a lone `*` advances the level
+  ported), `@` boss-bar triggers latch the boss bar
+  (Phase 2: slot 131, anim set 1027, drawn at screen
+  (12, 295) while latched and facing the right way),
+  a lone `*` advances the level
   (progress saved, next level loads, or menu
   after the last level). Level 1's end script
   is at tiles (214, 30-33): [^dialog, !, *].
   Tutorial scripts along the path fire correctly
   in --play. Not yet: level intro dialog (level
   header Q, e.g. string 122), state-109
-  interstitial, boss bars, `^` weapon switches.
+  interstitial, `^` weapon switches.
   `cargo test`: 52/52. Note: walking to tile 214
   in --play is blocked at ga=2161 by a tall
   building wall — climb / box-push mechanics
@@ -387,13 +389,57 @@ down, down, Select, Select, and draws the result to
 - Still open: v0.2 (push + tag + Windows zip with
   MSVC audit, when asked).
 
+## Phase 1 — Movement & world (slices 19-23, DONE 2026-11-05)
+
+- **Slice 19 — double jump:** Up while airborne in action 24
+  double-jumps (action 25). Combined peak 96 px. `cargo test`: the
+  double-jump test peaks at gb<=470; the ga=690 step is cleared.
+- **Slice 20 — full tile flags:** `TileFlags::build` covers the
+  whole load-time catalog (header bits + types 22/31/5/9/29/0/18/
+  10/25/14/30/28/8 + sprite footprints 27/7/35). Climb columns
+  are flag 9 (solid + climbable). The crate is solid now.
+- **Slice 21 — climb:** wall attach from a jump/fall into a
+  flag-8 wall (hold 33), climb up 35 (-19 px/cycle), down 34
+  (+20 px/cycle), turn 44, attack 36. Camera sits 80 px lower
+  while climbing.
+- **Slice 22 — box grab/push:** new module `boxes.rs`. Walk into
+  a flag-512 tile to grab (21); push (22) / pull (23) on a fresh
+  Left/Right press; `u()` moves the box 2 tiles (push) or 1
+  (pull) at once, with a linear slide to its new tile. Jump out
+  of a grab (21 -> 24).
+- **Slice 23 — ledge mount, camera zones, f()/g() completion:**
+  ledge grab (37, hang at gb = row*16 + 34) and mount (38,
+  vault onto the ledge); walk-off-ledge falls; camera zones
+  (type 3, step 7 px/tick); one-way platform drop-through
+  (flag 8192, Down); switches (type-9, flag 256) and doors
+  (type-35) in new module `doors.rs`; levers (type-34, Down
+  near one toggles its doors — the (206,32) lever opens the
+  pillar door before the level-end trigger). The level-1 wall
+  crossing and the temple-floor run to the level end are both
+  verified by Gameplay tests. `cargo test`: 100/100. Windows
+  cross-build OK (2,468,657 bytes). Not yet pushed/released.
+
+- Phase 2 DONE (2026-11-05): boss research, then boss bars
+  (slot 131). The bar is a looping 2-frame animation (anim set
+  1027 actions 2/6/8), NOT a damage-driven health bar: `@` +
+  two digits latches aR/aS/aT, the bar draws at screen (12, 295)
+  while latched and facing the right way, and clears when the
+  player leaves the trigger tiles. fR/fS/fQ are the grapple
+  mini-game (not ported), not boss-bar fields. `cargo test`:
+  103/103. Windows cross-build OK (2,474,209 bytes). v0.6.0
+  (Phases 1+2) ready, awaiting the user's go-ahead to push +
+  release.
+
 ## Next steps (see ../REPORT.md)
-1. Slice 3b: entity/object data after the tile map, spawn, then
-   player/enemy update in state 1.
-2. Window layer (keyboard input, integer scaling, frame timing) on top
-   of the framebuffer — not yet built; the shim is backend-free by design.
-3. MIDI/3GP media (`d.java`) — not yet ported.
-4. RP chunk types 247/245/255, RP2 def-chunk-6 anomaly — still open.
+1. Phase 3: magic (modes 2/3 fire, costs, type-3 damage orbs).
+2. Phase 3: magic (modes 2/3 fire, costs, type-3 damage orbs).
+3. Phase 4: enemy AI depth + real '!' cutscene playback.
+4. Phase 5: menus & meta (in-game menu, settings, Arena waves,
+   level-placed collectibles, state-109 interstitial, lever pull
+   animations, type-28 rectangle door triggers).
+5. Phase 6: combat polish (hurt reactions, block poses 27/28,
+   fire-while-grabbing release, HUD weapon icon per mode).
+6. Phase 7: presentation, loose ends & v1.0.
 
 The original jar is loaded from the user's own copy at runtime; no Glu
 assets are redistributed in this repo.

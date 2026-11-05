@@ -148,6 +148,13 @@ pub fn draw_enemies(
 
 #[cfg(test)]
 mod tests {
+    /// Tile flags for 9217 with the slice-20 footprints.
+    fn flags_9217(parsed: &crate::entities::LevelEntities) -> crate::player::TileFlags {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let footprints = crate::entities::load_footprints(&mut res, parsed).unwrap();
+        crate::player::TileFlags::build(parsed, &footprints)
+    }
+
     #[test]
     fn enemy_spawn_9217() {
         let data = std::fs::read("../extracted/RP9").unwrap();
@@ -173,7 +180,7 @@ mod tests {
         let pack = crate::rp::parse_pack(&data).unwrap();
         let chunk = pack.chunk(1).unwrap();
         let parsed = crate::entities::parse_level_entities(9217, &chunk).unwrap();
-        let flags = crate::player::TileFlags::build(&parsed);
+        let flags = flags_9217(&parsed);
         let list = super::enemies(&parsed);
         let enemy = list.iter().find(|e| e.x == 336).unwrap().clone();
         let anim_data = std::fs::read("../extracted/RP18").unwrap();
@@ -213,7 +220,7 @@ mod tests {
         // Further hits are ignored while dying.
         assert!(!st.apply_damage(&anim, 2));
         // Advance until the animation finishes.
-        let flags = crate::player::TileFlags::build(&parsed);
+        let flags = flags_9217(&parsed);
         for _ in 0..100 {
             st.tick(&anim, &flags, 436, 560);
             if st.dead {
@@ -243,7 +250,7 @@ mod tests {
         assert_eq!(st.action, 2, "kind 11 staggers with action 2");
         // While staggering, the enemy neither attacks nor
         // moves, even with the player in attack range.
-        let flags = crate::player::TileFlags::build(&parsed);
+        let flags = flags_9217(&parsed);
         let dmg = st.tick(&anim, &flags, 458, 560);
         assert_eq!(dmg, 0);
         assert_eq!(st.action, 2);

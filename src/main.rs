@@ -16,6 +16,8 @@
 
 mod pickups;
 mod script;
+mod boxes;
+mod doors;
 #[cfg(feature = "window")]
 mod play_window;
 mod anim;
@@ -391,7 +393,22 @@ fn main() {
         let mut res = resources::Resources::new(&target);
         let chunk = res.chunk(level_id).expect("level chunk");
         let parsed = entities::parse_level_entities(level_id, &chunk).expect("parse entities");
-        let flags = player::TileFlags::build(&parsed);
+        let footprints = entities::load_footprints(&mut res, &parsed).expect("load footprints");
+        let mut flags = player::TileFlags::build(&parsed, &footprints);
+        // Type-27 boxes (slice 22): anim 6144 + sprite
+        // 6146, base palette in --play (no key).
+        let box_anim_chunk = res.chunk(boxes::BOX_ANIM_SET).expect("box anim set 6144");
+        let box_anim = anim::load_anim_set(&box_anim_chunk).expect("load box anim");
+        let box_sprites = res
+            .sprite_set(boxes::BOX_SPRITE_SET, None)
+            .expect("box sprite set 6146");
+        let mut play_boxes = boxes::load_boxes(&mut res, &parsed, None).expect("load boxes");
+        // Type-9 switches and type-35 doors (slice 23).
+        let play_switches = doors::load_switches(&parsed);
+        let mut play_doors = doors::load_doors(&mut res, &parsed, None).expect("load doors");
+        // Type-34 levers (slice 23).
+        let mut play_levers = doors::load_levers(&parsed);
+        let mut prev_block_held = false;
         let player_anim_chunk = res.chunk(28672).expect("player anim set 28672");
         let player_anim = anim::load_anim_set(&player_anim_chunk).expect("load player anim");
         let player_sprites = res.sprite_set(28673, None).expect("player sprite set 28673");
@@ -404,6 +421,8 @@ fn main() {
             start_cam_x,
             start_cam_y,
         );
+        // Type-3 camera zones (slice 23).
+        pl.set_camera_zones(entities::camera_zones(&parsed));
         let enemy_list0 = enemies::enemies(&parsed);
         let mut enemy_states: Vec<enemies::EnemyState> = Vec::new();
         for e in enemy_list0 {
@@ -432,7 +451,26 @@ fn main() {
             }
             _ => None,
         };
+        // Boss-bar sets (Phase 2): same anim set
+        // 1027 + sprite set 1040 as the marker, but
+        // slot 131 with the latched action (set on
+        // latch; initialised to action 2).
+        let mut boss_bar_state: Option<(
+            anim::AnimSet,
+            resources::SpriteSet,
+            anim::AnimSlot,
+        )> = match (
+            res.chunk(1027).ok().and_then(|c| anim::load_anim_set(&c).ok()),
+            res.sprite_set(1040, None).ok(),
+        ) {
+            (Some(anim_set), Some(sprites)) => {
+                let slot = anim::AnimSlot::new(&anim_set, 2);
+                Some((anim_set, sprites, slot))
+            }
+            _ => None,
+        };
         let mut held = 0;
+        let mut prev_held = 0;
         let mut block_held = false;
         let mut combo_hits = 0;
         let mut combo_timer_ms = 0;
@@ -466,6 +504,12 @@ fn main() {
             match key.as_str() {
                 "left" => held = -1,
                 "right" => held = 1,
+                "unhold" => {
+                    // Release the held direction (so the
+                    // next left/right is a fresh press;
+                    // used to push a grabbed box, slice 22).
+                    held = 0;
+                }
                 "down" => {
                     // Hold-to-block (slice 18).
                     block_held = true;
@@ -479,8 +523,16 @@ fn main() {
                 "up" => {
                     if let Ok(anim_chunk) = res.chunk(28672) {
                         if let Ok(anim_set) = anim::load_anim_set(&anim_chunk) {
-                            if pl.jump(&anim_set) {
-                                println!("player jumps (action 24)");
+                            // Up while holding on a wall climbs
+                            // up (slice 21); otherwise it jumps.
+                            if pl.action == 33 {
+                                if pl.climb_up(&anim_set, &flags) {
+                                    println!("player climbs up (action 35)");
+                                } else {
+                                    println!("climb up blocked");
+                                }
+                            } else if pl.jump(&anim_set) {
+                                println!("player jumps (action {})", pl.action);
                             }
                         }
                     }
@@ -542,6 +594,9 @@ fn main() {
                                 gameplay::level_index(level_id) + 1
                             );
                         }
+                        // A latch never fires from advance
+                        // (only from check_trigger).
+                        script::ScriptEvent::BossBarLatched => {}
                         script::ScriptEvent::None => {}
                     }
                     if let Some(mode) = script_engine.take_weapon_switch() {
@@ -561,15 +616,43 @@ fn main() {
                             combo_hits = 0;
                         }
                     }
+                    // Climb turn (slice 21): held Left/Right
+                    // opposite to the facing while holding
+                    // (33) flips the player (44).
+                    if pl.action == 33 && held != 0 {
+                        pl.climb_turn(&player_anim, held);
+                    }
                     // Block stance (slice 18): Down held
-                    // starts it, release ends it.
+                    // starts it, release ends it. Down
+                    // held while holding on a wall
+                    // (slice 21) climbs down (34) or
+                    // drops (26) instead.
                     if block_held {
-                        if !pl.blocking || pl.action == 0 {
+                        // Lever pull (slice 23): Down
+                        // pressed near a type-34 lever
+                        // toggles its doors.
+                        if !prev_block_held && (pl.action == 0 || pl.action == 9) {
+                            if let Some(lx) = doors::check_lever(&mut play_levers, &mut play_doors, &mut flags, pl.ga, pl.gb) {
+                                pl.ga = lx;
+                                println!("lever pulled, doors toggled");
+                            }
+                        }
+                        if pl.action == 37 {
+                            // Drop from a ledge hang
+                            // (slice 23): Down lets go.
+                            pl.drop_from_hang(&player_anim);
+                        } else if pl.action == 33 {
+                            pl.climb_down(&player_anim, &flags);
+                        } else if pl.drop_through(&player_anim, &flags) {
+                            // Drop through a one-way
+                            // platform (slice 23).
+                        } else if !pl.blocking || pl.action == 0 {
                             pl.start_block(&player_anim);
                         }
                     } else if pl.blocking {
                         pl.stop_block(&player_anim);
                     }
+                    prev_block_held = block_held;
                     for st in &mut enemy_states {
                         if let Ok(anim_chunk) = res.chunk(st.enemy.anim_id) {
                             if let Ok(anim_set) = anim::load_anim_set(&anim_chunk) {
@@ -653,6 +736,45 @@ fn main() {
                             }
                         }
                     }
+                    // Box push/pull start (slice 22): a
+                    // fresh Left/Right press while grabbing
+                    // (21) starts the push (22) or pull
+                    // (23) and runs u() at once; failure
+                    // returns to the grab pose.
+                    let was_grabbing = pl.action == 21;
+                    if was_grabbing && held != 0 && held != prev_held {
+                        if let Some(gd) = pl.grabbed_box {
+                            let push = (held > 0) == pl.facing_right;
+                            let action = if push { 22 } else { 23 };
+                            pl.push_pull = if push { 1 } else { 0 };
+                            pl.action = action;
+                            pl.slot = anim::AnimSlot::new(&player_anim, action);
+                            let (gw, gx) = (pl.tile_x(), pl.walk_tile_y());
+                            let facing = pl.facing_right;
+                            if boxes::try_push(
+                                &mut play_boxes,
+                                gd,
+                                &mut flags,
+                                facing,
+                                action,
+                                gw,
+                                gx,
+                                &box_anim,
+                            ) {
+                                println!(
+                                    "player {}s box {} (action {})",
+                                    if push { "push" } else { "pull" },
+                                    gd,
+                                    action
+                                );
+                            } else {
+                                pl.action = 21;
+                                pl.slot = anim::AnimSlot::new(&player_anim, 21);
+                                println!("box push failed, still grabbing");
+                            }
+                        }
+                    }
+                    prev_held = held;
                     let step = pl.tick(
                         &player_anim,
                         &flags,
@@ -660,6 +782,20 @@ fn main() {
                         parsed.level.pixel_height() as i32,
                         held,
                     );
+                    // Box slots + slide, then the grab
+                    // check (after the walk stopped at
+                    // the box face).
+                    for b in &mut play_boxes {
+                        b.advance(&box_anim);
+                    }
+                    if boxes::check_grab(&play_boxes, &flags, &mut pl, &player_anim, held) {
+                        println!("player grabs box {}", pl.grabbed_box.unwrap());
+                    }
+                    // Type-9 switch (slice 23): standing
+                    // on a flag-256 tile toggles doors.
+                    if doors::check_switch(&play_switches, &mut play_doors, &mut flags, pl.tile_x(), pl.gb / 16) {
+                        println!("switch triggered, doors toggled");
+                    }
                     // Pickups home on the player's new position.
                     let enemy_pos: Vec<(i32, i32, bool)> = enemy_states
                         .iter()
@@ -685,6 +821,14 @@ fn main() {
                     if let Some((bar_anim, _, bar_slot)) = &mut bar_state {
                         bar_slot.advance(bar_anim, 40);
                     }
+                    // Boss-bar pulse (Phase 2, t(131)):
+                    // the slot advances each tick while
+                    // the `@` latch holds.
+                    if script_engine.boss_latched() {
+                        if let Some((boss_anim, _, boss_slot)) = &mut boss_bar_state {
+                            boss_slot.advance(boss_anim, 40);
+                        }
+                    }
                     // Script trigger check on the new tile.
                     if !play_completed {
                         match script_engine.check_trigger(pl.ga / 16, pl.gb / 16) {
@@ -696,6 +840,20 @@ fn main() {
                                 println!(
                                     "LEVEL COMPLETE: next level index {}",
                                     gameplay::level_index(level_id) + 1
+                                );
+                            }
+                            script::ScriptEvent::BossBarLatched => {
+                                // Phase 2: (re)set the boss-bar
+                                // slot (131) to the latched
+                                // action `aT`.
+                                if let Some((boss_anim, _, boss_slot)) = &mut boss_bar_state {
+                                    let action = script_engine.boss_action() as usize;
+                                    *boss_slot = anim::AnimSlot::new(boss_anim, action);
+                                }
+                                println!(
+                                    "boss bar latched: action={} facing_right={}",
+                                    script_engine.boss_action(),
+                                    script_engine.boss_facing_right()
                                 );
                             }
                             _ => {}
@@ -746,6 +904,11 @@ fn main() {
                 pl.cam_y,
             );
         }
+        // Boxes (slice 22): after the statics, before
+        // the enemies, at their px position.
+        for b in &play_boxes {
+            b.draw(&g, &mut fb, &box_anim, &box_sprites, pl.cam_x, pl.cam_y);
+        }
         let (drawn, skipped) = enemies::draw_enemy_states(&g, &mut fb, &mut res, &enemy_states, pl.cam_x, pl.cam_y);
         println!("enemies: {} drawn, {} skipped, {} total", drawn, skipped, enemy_states.len());
         if let Some((bar_anim, bar_sprites, bar_slot)) = &bar_state {
@@ -760,6 +923,45 @@ fn main() {
                 pl.cam_y,
             );
         }
+        // Boss bar (Phase 2): screen (12, 295) when
+        // the `@` latch holds, the player's facing
+        // equals `aS`, and the player is in the
+        // viewport.
+        if script_engine.boss_latched()
+            && script_engine.boss_facing_right() == pl.facing_right
+            && pl.ga >= pl.cam_x
+            && pl.ga < pl.cam_x + 240
+            && pl.gb >= pl.cam_y
+            && pl.gb < pl.cam_y + 320
+        {
+            if let Some((boss_anim, boss_sprites, boss_slot)) = &boss_bar_state {
+                if let Ok(frames) = anim::frames_for_timeline_frame(
+                    boss_anim,
+                    script_engine.boss_action() as usize,
+                    boss_slot.visual,
+                    0,
+                ) {
+                    for fr in frames {
+                        if let Some(frame) = boss_sprites.frame(fr.sprite_idx) {
+                            midp::draw_sprite_frame(
+                                &g,
+                                &mut fb,
+                                &boss_sprites.image,
+                                frame,
+                                12 + fr.dx,
+                                295 + fr.dy,
+                                fr.transform,
+                            );
+                        }
+                    }
+                }
+                println!(
+                    "boss bar: action={} visual={}",
+                    script_engine.boss_action(),
+                    boss_slot.visual
+                );
+            }
+        }
         for st in &enemy_states {
             println!(
                 "  enemy {}: type {} at ({},{}) facing_right={} action={} visual={} health={}/{} ef={}",
@@ -770,6 +972,12 @@ fn main() {
             println!(
                 "  orb {}: kind={} value={} at ({},{}) v=({},{}) age={}",
                 i, o.kind, o.value, o.x, o.y, o.vx, o.vy, o.age_ms
+            );
+        }
+        for b in &play_boxes {
+            println!(
+                "  box {}: eN={} at ({},{}) tile ({},{}) footprint {}x{} slot_action={}",
+                b.index, b.e_n, b.x, b.y, b.e_q, b.e_r, b.e_u, b.e_v, b.slot.action
             );
         }
         let player_transform = if pl.facing_right { 0 } else { 2 };
