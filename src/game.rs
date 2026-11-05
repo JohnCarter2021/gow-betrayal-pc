@@ -96,6 +96,11 @@ pub enum State {
     Exited,
     /// State 107: Help (ai=false) / About (ai=true) dialog.
     HelpAbout,
+    /// State 109: level-complete interstitial
+    /// (Phase 5, rest). Select continues to the
+    /// next level (with save); Exit goes to the
+    /// main menu.
+    LevelComplete,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +149,11 @@ pub struct Game {
     pub menu_progress: usize, // bD: highest unlocked level
     pub playing_level: Option<i32>, // bA: level id for state 1
     pub playing_arena: bool,  // iN: arena mode
+    /// State 109 (Phase 5, rest): the next level
+    /// index pending after the interstitial, and
+    /// the kills scored in the finished level.
+    pub pending_next_level: Option<usize>,
+    pub pending_kills: i32,
     pub help_or_about: Option<&'static str>,
     pub help_about_text: String,
     pub help_about_scroll: i32,
@@ -192,6 +202,8 @@ impl Game {
             menu_progress: 0,
             playing_level: None,
             playing_arena: false,
+            pending_next_level: None,
+            pending_kills: 0,
             help_or_about: None,
             help_about_text: String::new(),
             help_about_scroll: 0,
@@ -263,8 +275,10 @@ impl Game {
                 // Case 0 tail: A(1) save load (defaults if absent),
                 // then menu setup uses the loaded progress.
                 // Save comes from RecordStore "2" in save_dir
-                // when set, else defaults.
+                // when set, else defaults. Settings come from
+                // RecordStore "-9" (Phase 5, rest).
                 self.load_save();
+                self.load_settings();
                 let menu_chunk = self.res.chunk(1028)?;
                 let mut menu = Menu::from_chunk(&menu_chunk);
                 menu.apply_progress(self.save.progress as usize);
@@ -374,6 +388,26 @@ impl Game {
                     _ => {}
                 }
             }
+            State::LevelComplete => {
+                // State 109 interstitial (Phase 5, rest):
+                // Select continues to the next level
+                // (with save); Exit goes to the main
+                // menu. Anything else is ignored.
+                match input {
+                    Input::Select | Input::Attack => {
+                        self.advance_from_interstitial();
+                    }
+                    Input::Exit => {
+                        self.pending_next_level = None;
+                        self.gameplay = None;
+                        self.state = State::MainMenu;
+                        if let Some(menu) = &mut self.menu {
+                            menu.apply_progress(self.menu_progress);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             State::Playing => {
                 // A showing level intro dialog captures
                 // input first: Select/Exit dismisses it
@@ -420,6 +454,20 @@ impl Game {
                     }
                     return;
                 }
+                // An open pause menu (Phase 5, rest,
+                // state 102) captures input: Up/Down
+                // move the page, Select confirms, Exit
+                // backs out or resumes. The world stays
+                // frozen meanwhile.
+                if self
+                    .gameplay
+                    .as_ref()
+                    .map(|gp| gp.menu_open())
+                    .unwrap_or(false)
+                {
+                    self.handle_menu_input(input);
+                    return;
+                }
                 // Gameplay keys: Left/Right set the held direction and
                 // advance one frame, Attack swings and advances one frame,
                 // Up jumps and advances one frame, Select cycles weapons
@@ -460,8 +508,13 @@ impl Game {
                         self.gameplay_tick_attack();
                     }
                     Input::Exit => {
-                        self.state = State::MainMenu;
-                        self.gameplay = None;
+                        // Exit opens the in-game pause
+                        // menu (state 102, Phase 5, rest)
+                        // instead of quitting straight to
+                        // the main menu.
+                        if let Some(gp) = &mut self.gameplay {
+                            gp.open_menu();
+                        }
                     }
                     _ => {}
                 }
@@ -530,6 +583,96 @@ impl Game {
         }
     }
 
+    /// Settings store "-9" (Phase 5, rest): a
+    /// single byte, 1 = sound on, 0 = sound off.
+    /// Read at boot (default on when absent);
+    /// written when the menu toggles sound.
+    pub fn load_settings(&mut self) {
+        if let Some(dir) = &self.save_dir {
+            let rs = crate::midp::RecordStore::new(dir);
+            if let Some(bytes) = rs.read_all("-9") {
+                if let Some(&b) = bytes.first() {
+                    let enabled = b != 0;
+                    self.audio_enabled = Some(enabled);
+                    self.audio.set_enabled(enabled);
+                    return;
+                }
+            }
+        }
+        self.audio_enabled = Some(true);
+        self.audio.set_enabled(true);
+    }
+
+    /// Write the sound setting to store "-9".
+    pub fn persist_settings(&mut self) {
+        if let Some(dir) = &self.save_dir {
+            let rs = crate::midp::RecordStore::new(dir);
+            let b: u8 = if self.audio_enabled.unwrap_or(true) { 1 } else { 0 };
+            rs.write_all("-9", Some(&[b]));
+        }
+    }
+
+    /// Pause-menu input (state 102, Phase 5, rest):
+    /// Up/Down move the page, Select confirms,
+    /// Exit backs out or resumes. Acts on the
+    /// outcome the menu returns.
+    fn handle_menu_input(&mut self, input: Input) {
+        let Some(gp) = &mut self.gameplay else {
+            return;
+        };
+        let Some(menu) = &mut gp.menu else {
+            return;
+        };
+        use crate::pause_menu::MenuOutcome;
+        let outcome = match input {
+            Input::Up => {
+                menu.up();
+                MenuOutcome::Stay
+            }
+            Input::Down => {
+                menu.down();
+                MenuOutcome::Stay
+            }
+            Input::Select | Input::Attack => menu.select(),
+            Input::Exit => menu.exit(),
+            _ => MenuOutcome::Stay,
+        };
+        match outcome {
+            MenuOutcome::Stay => {}
+            MenuOutcome::Resume => {
+                if let Some(gp) = &mut self.gameplay {
+                    gp.menu = None;
+                }
+            }
+            MenuOutcome::MainMenu => {
+                self.persist_save();
+                self.gameplay = None;
+                self.state = State::MainMenu;
+                if let Some(menu) = &mut self.menu {
+                    menu.apply_progress(self.menu_progress);
+                }
+            }
+            MenuOutcome::QuitApp => {
+                self.persist_save();
+                self.exited = true;
+                self.state = State::Exited;
+            }
+            MenuOutcome::Help => {
+                if let Some(gp) = &mut self.gameplay {
+                    gp.menu = None;
+                }
+                self.state = State::HelpAbout;
+                self.help_about_scroll = 0;
+            }
+            MenuOutcome::SoundToggle => {
+                let enabled = !self.audio_enabled.unwrap_or(true);
+                self.audio_enabled = Some(enabled);
+                self.audio.set_enabled(enabled);
+                self.persist_settings();
+            }
+        }
+    }
+
     /// Delete RecordStore "2" (Clear Save).
     pub fn clear_save_file(&mut self) {
         if let Some(dir) = &self.save_dir {
@@ -574,12 +717,30 @@ impl Game {
     /// Consume a level-complete flag from gameplay:
     /// save progress, then load the next level, or
     /// return to the main menu after the last level.
+    /// Level complete (state 109, Phase 5, rest):
+    /// instead of advancing at once, show the
+    /// interstitial; Select continues (with save),
+    /// Exit goes to the main menu. The kills from
+    /// the finished level are kept for the screen.
     fn handle_level_complete(&mut self) {
-        let next_idx = match &mut self.gameplay {
-            Some(gp) => gp.level_complete.take(),
-            None => None,
+        let (next_idx, kills) = match &mut self.gameplay {
+            Some(gp) => (gp.level_complete.take(), gp.kills),
+            None => (None, 0),
         };
         let Some(next_idx) = next_idx else {
+            return;
+        };
+        self.pending_next_level = Some(next_idx);
+        self.pending_kills = kills;
+        self.state = State::LevelComplete;
+    }
+
+    /// Advance past the interstitial (Select on
+    /// state 109): save progress and load the
+    /// next level, or return to the main menu when
+    /// all levels are done.
+    fn advance_from_interstitial(&mut self) {
+        let Some(next_idx) = self.pending_next_level.take() else {
             return;
         };
         if next_idx < 10 {
@@ -591,6 +752,7 @@ impl Game {
             self.playing_level = Some(crate::gameplay::LEVEL_IDS[next_idx] as i32);
             self.playing_arena = false;
             self.enter_playing();
+            self.state = State::Playing;
         } else {
             if self.save.progress < 10 {
                 self.save.progress = 10;
@@ -1055,6 +1217,32 @@ self.state = State::Playing;
                     // bitmap font (def 1031) already loaded by boot.
                     if let Some(font) = &self.font {
                         gp.draw(fb, &mut self.res, font);
+                        // Pause menu overlay (state 102, Phase 5,
+                        // rest): the title is the level name
+                        // (string 54 + index) or "Arena", then
+                        // the current page label, and the confirm
+                        // prompt when confirming.
+                        if let Some(menu) = &gp.menu {
+                            let title = if gp.arena {
+                                "Arena".to_string()
+                            } else {
+                                self.string(54 + gp.level_index).to_string()
+                            };
+                            font.draw(&g, fb, &title, 120, 140, 1);
+                            if menu.confirm {
+                                if let Some(prompt) = menu.confirm_label() {
+                                    font.draw(&g, fb, prompt, 120, 170, 1);
+                                }
+                            } else {
+                                let label = if menu.page == crate::pause_menu::PAGE_SOUND {
+                                    let on = self.audio_enabled.unwrap_or(true);
+                                    format!("Sound {}", if on { "on" } else { "off" })
+                                } else {
+                                    menu.page_label().to_string()
+                                };
+                                font.draw(&g, fb, &label, 120, 170, 1);
+                            }
+                        }
                     }
                 } else {
                     // Fallback placeholder if gameplay failed to load.
@@ -1066,6 +1254,19 @@ self.state = State::Playing;
                     };
                     font.draw(&g, fb, &level_name, 120, 140, 1);
                     font.draw(&g, fb, "gameplay: slice 3", 120, 160, 1);
+                }
+            }
+            State::LevelComplete => {
+                // State 109 interstitial (Phase 5, rest):
+                // "Level Complete", the kills scored,
+                // and the softkeys (Select continues,
+                // Exit goes to the menu).
+                if let Some(font) = &self.font {
+                    font.draw(&g, fb, "Level Complete", 120, 140, 1);
+                    let kills = format!("Kills: {}", self.pending_kills);
+                    font.draw(&g, fb, &kills, 120, 170, 1);
+                    font.draw(&g, fb, "Select: continue", 120, 200, 1);
+                    font.draw(&g, fb, "Exit: main menu", 120, 220, 1);
                 }
             }
             _ => {}
@@ -1323,6 +1524,57 @@ mod help_about_tests {
     }
 }
 
+    #[test]
+    fn settings_store_persists_sound() {
+        // Phase 5, rest: the "-9" store holds one
+        // byte (1 = sound on, 0 = off). Toggling
+        // writes it; a fresh Game reads it back.
+        let dir = std::env::temp_dir().join("gow-test-settings");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut g = Game::new("../extracted");
+        g.save_dir = Some(dir.clone());
+        g.load_settings();
+        assert_eq!(g.audio_enabled, Some(true), "default on when absent");
+        g.audio_enabled = Some(false);
+        g.audio.set_enabled(false);
+        g.persist_settings();
+        let mut g2 = Game::new("../extracted");
+        g2.save_dir = Some(dir.clone());
+        g2.load_settings();
+        assert_eq!(g2.audio_enabled, Some(false), "off persists across Games");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn level_complete_shows_interstitial_then_advances() {
+        // Phase 5, rest (state 109): completing a
+        // level shows the interstitial instead of
+        // advancing at once; Select continues to the
+        // next level, Exit goes to the main menu.
+        let mut game = Game::new("../extracted");
+        game.boot().unwrap();
+        // Jump straight to Playing level 9217.
+        game.state = State::Playing;
+        game.playing_level = Some(9217);
+        game.playing_arena = false;
+        game.enter_playing();
+        assert!(game.gameplay.is_some());
+        // Simulate the level completing.
+        if let Some(gp) = &mut game.gameplay {
+            gp.level_complete = Some(1);
+            gp.kills = 3;
+        }
+        game.handle_level_complete();
+        assert_eq!(game.state, State::LevelComplete);
+        assert_eq!(game.pending_next_level, Some(1));
+        assert_eq!(game.pending_kills, 3);
+        // Select advances to level index 1 (19456).
+        game.update(Some(Input::Select));
+        assert_eq!(game.state, State::Playing);
+        assert_eq!(game.playing_level, Some(19456));
+    }
+
+
 #[cfg(test)]
 mod audio_tests {
     #[test]
@@ -1344,4 +1596,5 @@ mod audio_tests {
         assert!(!g2.audio.enabled);
         assert_eq!(g2.audio.current_slot, None);
     }
+
 }

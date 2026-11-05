@@ -2,14 +2,13 @@
 
 A Rust PC port, in progress, of *God of War: Betrayal* (J2ME, Glu Mobile, v1.4.8).
 
-Status, 2026-11-05 — v0.9.0: everything in v0.8.0, plus Phase 5
-(partial: lever pull animations — Down near a lever plays action
-15 pull / 17 un-pull while the doors toggle; type-28 rectangle
-door triggers — standing on a flag-32 tile inside a rect toggles
-its door, up to `count` times, 2 s cooldown; level-placed
-collectibles — type-4 gold/health/magic orb bundles totalling
-`fs`, and ho/hp upgrades that raise max health/magic by 192 and
-refill):
+Status, 2026-11-05 — v1.0.0: everything in v0.9.0, plus Phase 5
+complete (pause menu — Escape opens the in-game menu with
+Exit / Main menu / Help / Sound and confirm prompts; settings
+store "-9" — the sound setting persists across runs; Arena
+kills HUD — "Kills: N" counts every enemy death; state-109
+level-complete interstitial — Select continues with save,
+Exit goes to the main menu):
 
 - **MIDP shim, std-only, no crates:** 240×320 framebuffer, `Graphics`
   (clip / translate / `drawRegion` with all 8 MIDP transforms), sprite

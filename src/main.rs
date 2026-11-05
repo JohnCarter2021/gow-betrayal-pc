@@ -19,6 +19,7 @@ mod script;
 mod boxes;
 mod doors;
 mod collectibles;
+mod pause_menu;
 #[cfg(feature = "window")]
 mod play_window;
 mod anim;

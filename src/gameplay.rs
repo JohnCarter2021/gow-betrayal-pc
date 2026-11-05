@@ -82,6 +82,14 @@ pub struct Gameplay {
     /// all levels done). The caller (Game, --play)
     /// consumes it and advances or returns to menu.
     pub level_complete: Option<usize>,
+    /// Pause menu, state 102 (Phase 5, rest):
+    /// `Some` while the menu is open; the world
+    /// freezes (tick is a no-op) until it closes.
+    pub menu: Option<crate::pause_menu::PauseMenu>,
+    /// Arena kill count `dI` (Phase 5, rest):
+    /// incremented on every enemy death; shown
+    /// as "Kills: N" in the Arena HUD.
+    pub kills: i32,
     /// Weakened-marker animation (slice 14): anim
     /// set 1027, sprite set 1040 (`aU`), slot for
     /// action 10, advanced once per tick. None when
@@ -379,6 +387,8 @@ impl Gameplay {
             ),
             script: ScriptEngine::new(triggers, strings),
             level_complete: None,
+            menu: None,
+            kills: 0,
             bar,
             boss_bar,
             intro_index,
@@ -420,6 +430,19 @@ impl Gameplay {
     /// gameplay starts on the next tick.
     pub fn dismiss_intro(&mut self) {
         self.intro_text = None;
+    }
+
+    /// Open the pause menu (state 102, Phase 5,
+    /// rest). The world freezes while it is open;
+    /// the caller routes menu input to it and
+    /// acts on the outcome it returns.
+    pub fn open_menu(&mut self) {
+        self.menu = Some(crate::pause_menu::PauseMenu::new());
+    }
+
+    /// True while the pause menu is open.
+    pub fn menu_open(&self) -> bool {
+        self.menu.is_some()
     }
 
     /// Apply pickup events from a tick: gold/health/
@@ -465,6 +488,9 @@ impl Gameplay {
                         }
                     };
                     if let Some((x, y, kind, em)) = killed_drop {
+                        // Arena kill count `dI` (Phase 5,
+                        // rest): a damage orb killed it.
+                        self.kills += 1;
                         let drop_kind = match kind {
                             12 => crate::pickups::MAGIC,
                             _ => crate::pickups::GOLD,
@@ -733,6 +759,12 @@ impl Gameplay {
         if self.intro_text.is_some() {
             return;
         }
+        // An open pause menu (Phase 5, rest, state
+        // 102) freezes the world; the menu handles
+        // its own input (Game routes it there).
+        if self.menu.is_some() {
+            return;
+        }
         // A playing cutscene (Phase 4, state 105):
         // advance the cutscene actions only — the
         // world is frozen (no input, no enemy AI).
@@ -900,6 +932,12 @@ impl Gameplay {
                     };
                     self.combo_hits += 1;
                     self.combo_timer_ms = 2000;
+                    // Arena kill count `dI` (Phase 5,
+                    // rest): incremented on every enemy
+                    // death, in any mode.
+                    if killed {
+                        self.kills += 1;
+                    }
                     // Artemis drains magic per hit
                     // (slice 17): `fJ * 3`, clamped
                     // at 0 (the original's `hl` can go
@@ -1162,11 +1200,18 @@ impl Gameplay {
             health: self.player.health,
             max_health: self.player.max_health,
             magic: self.magic,
-            max_magic: 1024,
+            max_magic: self.max_magic,
             gold: self.gold,
             combo_hits: self.combo_hits,
         };
         hud::draw_hud(&g, fb, res, font, &hud_state);
+        // Arena kills HUD (Phase 5, rest, e.java
+        // ~7750): "Kills: N" at screen (120, 306),
+        // only in Arena mode.
+        if self.arena {
+            let text = format!("Kills: {}", self.kills);
+            font.draw(&g, fb, &text, 120, 306, 0);
+        }
         // Boss bar (Phase 2, `d(Graphics)` state 100):
         // drawn at screen (12, F - 25) = (12, 295)
         // when the `@` latch holds, the player's
@@ -2178,6 +2223,45 @@ mod tests {
         gp.player.action = 0;
         gp.tick(&mut res, 0, false);
         assert_eq!(gp.pickups.orbs.len(), before, "collected item does not re-spawn");
+    }
+
+    #[test]
+    fn pause_menu_freezes_world_and_kills_count() {
+        // Phase 5, rest: opening the pause menu
+        // freezes the world (tick is a no-op), and
+        // killing an enemy increments the kill count.
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        assert_eq!(gp.kills, 0);
+        gp.open_menu();
+        assert!(gp.menu_open());
+        let (ga, gb) = (gp.player.ga, gp.player.gb);
+        gp.tick(&mut res, 1, false);
+        assert_eq!((gp.player.ga, gp.player.gb), (ga, gb), "world frozen while menu open");
+        // Close the menu and kill the dY=0 enemy
+        // (spawn 336,560) with a swing: stand next
+        // to it and attack (the helper ticks with
+        // attack=true, which starts action 54).
+        gp.menu = None;
+        let idx = gp.enemy_states.iter().position(|s| s.enemy.dy == 0).unwrap();
+        gp.player.ga = 336 - 16;
+        gp.player.gb = 560;
+        gp.player.facing_right = true;
+        // Weaken it first so one 2-damage swing kills.
+        gp.enemy_states[idx].health = 2;
+        t(&mut gp, &mut res, 0, true);
+        assert_eq!(gp.player.action, 54, "swing starts");
+        // Tick until the swing lands (the hit check
+        // runs while the swing is active).
+        for _ in 0..10 {
+            t(&mut gp, &mut res, 0, false);
+            if gp.enemy_states[idx].dead || gp.enemy_states[idx].dying {
+                break;
+            }
+        }
+        assert!(gp.enemy_states[idx].dead || gp.enemy_states[idx].dying, "enemy killed by the swing");
+        assert_eq!(gp.kills, 1, "kill count increments on death");
     }
 
     #[test]

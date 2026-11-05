@@ -466,15 +466,27 @@ down, down, Select, Select, and draws the result to
   collectibles (type-4: gold/health/magic orb bundles
   totalling `fs`, and upgrades — ft=3 raises max health
   or magic by 192 and refills). `cargo test`: 119/119.
-  Windows cross-build OK (2,499,230 bytes). Deferred:
-  in-game menu/pause (state 102), settings store "-9",
-  Arena waves/scoring, state-109 interstitial, state-104
-  upgrade interstitial.
+  Windows cross-build OK (2,499,145 bytes). Cargo version
+  0.9.0. v0.9.0 shipped 2026-11-05 ~16:07 IST (commit
+  905f0519, release tag v0.9.0, release id 435064795).
+
+- Phase 5 COMPLETE (2026-11-05): the rest — pause menu
+  (state 102: Exit / Main menu / Help / Sound, with
+  confirm sub-pages; Exit during gameplay now opens it
+  instead of quitting straight to the menu); settings
+  store "-9" (one byte, sound on/off, read at boot,
+  written on toggle); Arena kills HUD ("Kills: N",
+  kill count increments on every enemy death); state-109
+  level-complete interstitial (Select continues with
+  save, Exit goes to the menu). `cargo test`: 128/128.
+  Windows cross-build OK (2,502,355 bytes). Not yet
+  released — awaiting a go-ahead to ship (v1.0.0 per
+  the plan). Gaps: Arena wave respawn untraced, best
+  score / "You Are Dead" screen not ported (no death
+  screen yet).
 
 ## Next steps (see ../REPORT.md)
-1. Phase 5 (rest): in-game menu/pause (state 102),
-   settings store "-9", Arena waves/scoring, state-109
-   interstitial.
+1. Ship Phase 5 complete (v1.0.0 per the plan) — awaiting go-ahead.
 2. Phase 6: combat polish (hurt reactions, block poses 27/28,
    fire-while-grabbing release, HUD weapon icon per mode).
 6. Phase 7: presentation, loose ends & v1.0.
