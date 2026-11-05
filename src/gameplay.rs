@@ -115,6 +115,42 @@ pub struct Gameplay {
     /// a push/pull starts only on a fresh press edge
     /// (dir != prev_dir) while grabbing.
     prev_dir: i32,
+    /// Cutscene playback (Phase 4, state 105): the
+    /// type-6 aY/aZ action tables, loaded at level
+    /// load. `cutscene_ba`/`cutscene_bb` are the
+    /// current table indices (persist across
+    /// cutscenes within a level, reset only on
+    /// level load, D()). `cutscene_active` is true
+    /// while a cutscene is playing.
+    cutscene_ay: [u32; 40],
+    cutscene_az: [u32; 40],
+    cutscene_ba: usize,
+    cutscene_bb: usize,
+    /// Cutscene target enemy `dL` (the enemy whose
+    /// spawn bit extra[2] is set), or None when no
+    /// enemy has it (player-only cutscene).
+    cutscene_target: Option<usize>,
+    pub cutscene_active: bool,
+    /// Flag-4 enemy respawn (Phase 4, type-14):
+    /// triggers that refresh off-screen enemies
+    /// when the player crosses them. Each trigger
+    /// has a tile position and, per enemy index,
+    /// a new spawn point (eE, eF) and a flag (eG).
+    respawn_triggers: Vec<RespawnTrigger>,
+}
+
+/// One flag-4 respawn trigger (Phase 4, type-14).
+struct RespawnTrigger {
+    /// Trigger tile (eC, eD).
+    tile_x: i32,
+    tile_y: i32,
+    /// Vertical run length (the `n74` count): flag
+    /// 4 covers tiles (tile_x, tile_y ..= tile_y+len).
+    len: usize,
+    /// Per enemy index (dY): (new spawn x in px,
+    /// new spawn y in px, flag eG). An entry with
+    /// x == 0 means "no respawn for this enemy".
+    entries: Vec<(i32, i32, bool)>,
 }
 
 /// Marker slot state (slice 14).
@@ -153,6 +189,7 @@ impl Gameplay {
                     if let Ok(sprites) = res.sprite_set(e.sprite_id, None) {
                         st.ef = enemies::enemy_bbox_height(&anim_set, &sprites, e.action);
                     }
+                    st.anim_set = Some(anim_set);
                     enemy_states.push(st);
                 }
             }
@@ -241,6 +278,51 @@ impl Gameplay {
             None
         };
         let intro_text = intro_index.and_then(|i| strings.get(i).cloned());
+        // Type-6 cutscene action tables (Phase 4):
+        // 40 aY values then 40 aZ values, each
+        // 10-bit, in group(6).extra. Empty when the
+        // level has no type-6 group.
+        let (cutscene_ay, cutscene_az) = match parsed.group(6) {
+            Some(g6) => {
+                let mut ay = [0u32; 40];
+                let mut az = [0u32; 40];
+                for i in 0..40 {
+                    ay[i] = g6.extra.get(i).copied().unwrap_or(0);
+                    az[i] = g6.extra.get(40 + i).copied().unwrap_or(0);
+                }
+                (ay, az)
+            }
+            None => ([0u32; 40], [0u32; 40]),
+        };
+        // Cutscene target `dL`: the enemy whose spawn
+        // bit (extra[2]) is set, as an index into
+        // enemy_states (None when no enemy has it).
+        let cutscene_target = enemy_states
+            .iter()
+            .position(|st| st.enemy.cutscene_target);
+        // Flag-4 respawn triggers (Phase 4, type-14):
+        // per item, extra = [count, (eE, eF, eG) x15].
+        // The trigger tile is the item's position.
+        let mut respawn_triggers = Vec::new();
+        if let Some(g14) = parsed.group(14) {
+            for (i, &(px, py)) in g14.positions.iter().enumerate() {
+                let base = i * 46;
+                let len = g14.extra.get(base).copied().unwrap_or(0) as usize;
+                let mut entries = Vec::with_capacity(15);
+                for k in 0..15 {
+                    let ee = g14.extra.get(base + 1 + k * 3).copied().unwrap_or(0) as i32;
+                    let ef = g14.extra.get(base + 1 + k * 3 + 1).copied().unwrap_or(0) as i32;
+                    let eg = g14.extra.get(base + 1 + k * 3 + 2).copied().unwrap_or(0) != 0;
+                    entries.push((ee * 16, ef * 16, eg));
+                }
+                respawn_triggers.push(RespawnTrigger {
+                    tile_x: px / 16,
+                    tile_y: py / 16,
+                    len,
+                    entries,
+                });
+            }
+        }
         Ok(Gameplay {
             parsed,
             flags,
@@ -279,6 +361,13 @@ impl Gameplay {
             levers,
             prev_block_held: false,
             prev_dir: 0,
+            cutscene_ay,
+            cutscene_az,
+            cutscene_ba: 0,
+            cutscene_bb: 0,
+            cutscene_target,
+            cutscene_active: false,
+            respawn_triggers,
         })
     }
 
@@ -369,7 +458,13 @@ impl Gameplay {
 
     /// Advance the active script one step (Select key).
     /// A `*` step sets `level_complete` for the caller.
+    /// During a cutscene (Phase 4) Select does nothing
+    /// — the cutscene plays on its own and advances
+    /// the script when it ends (C()).
     pub fn script_advance(&mut self) {
+        if self.cutscene_active {
+            return;
+        }
         let ev = self.script.advance();
         self.handle_script_event(ev);
         self.apply_weapon_switch();
@@ -440,6 +535,105 @@ impl Gameplay {
                 bb.slot = crate::anim::AnimSlot::new(&bb.anim, action as usize);
             }
         }
+        if ev == ScriptEvent::Cutscene {
+            // Phase 4: a `!` step — start state-105
+            // playback. The player takes aY[ba] and
+            // the target enemy (dL) takes aZ[bb].
+            // The world is frozen while it plays.
+            self.start_cutscene();
+        }
+    }
+
+    /// Start a `!` cutscene (Phase 4, state 105):
+    /// set the player's action to aY[ba] and the
+    /// target enemy's action to aZ[bb]. When the
+    /// current aY entry is 0 the cutscene ends
+    /// immediately (nothing to play).
+    fn start_cutscene(&mut self) {
+        let action = self.cutscene_ay[self.cutscene_ba] as usize;
+        if action == 0 {
+            // Nothing to play: end at once (C()).
+            self.end_cutscene();
+            return;
+        }
+        self.cutscene_active = true;
+        self.player.action = action;
+        self.player.slot = anim::AnimSlot::new(&self.player_anim, action);
+        if let Some(ti) = self.cutscene_target {
+            let eaction = self.cutscene_az[self.cutscene_bb] as usize;
+            if eaction != 0 {
+                if let Some(st) = self.enemy_states.get_mut(ti) {
+                    st.action = eaction;
+                    if let Some(anim_set) = &st.anim_set {
+                        st.slot = anim::AnimSlot::new(anim_set, eaction);
+                    }
+                }
+            }
+        }
+    }
+
+    /// End the cutscene (C()): back to gameplay
+    /// and advance the script past the `!` step.
+    fn end_cutscene(&mut self) {
+        self.cutscene_active = false;
+        let ev = self.script.advance();
+        self.handle_script_event(ev);
+        self.apply_weapon_switch();
+    }
+
+    /// One cutscene tick (Phase 4, state 105):
+    /// advance the player's cutscene action and
+    /// the target enemy's. When an action finishes,
+    /// step the table (ba/bb); when the next aY
+    /// entry is 0 and the next aZ is 0 (or there is
+    /// no target), the cutscene ends (C()).
+    fn tick_cutscene(&mut self) {
+        // Player: advance the cutscene action.
+        self.player.slot.advance(&self.player_anim, 40);
+        if self.player.slot.repeat == 0 {
+            let next_ay = self.cutscene_ay.get(self.cutscene_ba + 1).copied().unwrap_or(0);
+            let next_az = self.cutscene_az.get(self.cutscene_bb + 1).copied().unwrap_or(0);
+            let no_enemy = self.cutscene_target.is_none();
+            if next_ay == 0 && (next_az == 0 || no_enemy) {
+                self.end_cutscene();
+                return;
+            } else if next_ay == 0 {
+                // Repeat the current player action.
+                let action = self.cutscene_ay[self.cutscene_ba] as usize;
+                self.player.action = action;
+                self.player.slot = anim::AnimSlot::new(&self.player_anim, action);
+            } else {
+                self.cutscene_ba += 1;
+                let action = self.cutscene_ay[self.cutscene_ba] as usize;
+                self.player.action = action;
+                self.player.slot = anim::AnimSlot::new(&self.player_anim, action);
+            }
+        }
+        // Target enemy: advance its cutscene action.
+        if let Some(ti) = self.cutscene_target {
+            if let Some(st) = self.enemy_states.get_mut(ti) {
+                if let Some(anim_set) = st.anim_set.clone() {
+                    st.slot.advance(&anim_set, 40);
+                    if st.slot.repeat == 0 {
+                        let next_ay = self.cutscene_ay.get(self.cutscene_ba + 1).copied().unwrap_or(0);
+                        let next_az = self.cutscene_az.get(self.cutscene_bb + 1).copied().unwrap_or(0);
+                        if next_ay == 0 && next_az == 0 {
+                            self.end_cutscene();
+                            return;
+                        } else if next_az == 0 {
+                            let action = self.cutscene_az[self.cutscene_bb] as usize;
+                            st.action = action;
+                            st.slot = anim::AnimSlot::new(&anim_set, action);
+                        } else {
+                            self.cutscene_bb += 1;
+                            let action = self.cutscene_az[self.cutscene_bb] as usize;
+                            st.action = action;
+                            st.slot = anim::AnimSlot::new(&anim_set, action);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Mode-3 burst fire (Phase 3, `hd`): gate is
@@ -505,6 +699,13 @@ impl Gameplay {
         // (the original's state 1 -> 107 path shows
         // the dialog before gameplay state 100).
         if self.intro_text.is_some() {
+            return;
+        }
+        // A playing cutscene (Phase 4, state 105):
+        // advance the cutscene actions only — the
+        // world is frozen (no input, no enemy AI).
+        if self.cutscene_active {
+            self.tick_cutscene();
             return;
         }
         // A showing script freezes the world (the
@@ -607,7 +808,7 @@ impl Gameplay {
         for st in &mut self.enemy_states {
             if let Ok(anim_chunk) = res.chunk(st.enemy.anim_id) {
                 if let Ok(anim_set) = anim::load_anim_set(&anim_chunk) {
-                    let dmg = st.tick(&anim_set, &self.flags, px, py);
+                    let dmg = st.tick(&anim_set, &self.flags, px, py, &mut self.rng);
                     if dmg > 0 {
                         if self.player.blocking {
                             // Blocked hit (slice 18):
@@ -752,6 +953,68 @@ impl Gameplay {
             let ev = self.script.check_trigger(tx, ty);
             self.handle_script_event(ev);
             self.apply_weapon_switch();
+            // Flag-4 respawn (Phase 4, type-14):
+            // crossing a flag-4 tile refreshes
+            // off-screen enemies to new spawn points.
+            self.check_respawn(tx, ty);
+        }
+    }
+
+    /// Flag-4 respawn (Phase 4, type-14): when the
+    /// player stands on a flag-4 tile, find the
+    /// trigger whose column covers the tile, then
+    /// for each enemy with a table entry (eE != 0)
+    /// update its spawn point (dV/dW) and, if the
+    /// enemy is off-screen, respawn it there at full
+    /// health and idle. Clears flag 4 for the
+    /// trigger's tiles (single-use per trigger).
+    fn check_respawn(&mut self, tx: i32, ty: i32) {
+        if self.flags.get(tx, ty) & 4 == 0 {
+            return;
+        }
+        let Some(ti) = self
+            .respawn_triggers
+            .iter()
+            .position(|t| t.tile_x == tx && ty >= t.tile_y && ty <= t.tile_y + t.len as i32)
+        else {
+            return;
+        };
+        let trigger = &self.respawn_triggers[ti];
+        let (cam_x, cam_y) = (self.player.cam_x, self.player.cam_y);
+        for st in &mut self.enemy_states {
+            if st.dead || st.dying {
+                continue;
+            }
+            let dy = st.enemy.dy as usize;
+            let Some(&(nx, ny, _eg)) = trigger.entries.get(dy) else {
+                continue;
+            };
+            if nx == 0 {
+                continue;
+            }
+            // Update the spawn point (dV/dW).
+            st.enemy.x = nx;
+            st.enemy.y = ny;
+            // Respawn only when off-screen (the
+            // original's viewport-rect test, 368x448
+            // expanded by 64).
+            let in_view = nx >= cam_x - 64
+                && nx <= cam_x + 240 + 64
+                && ny >= cam_y - 64
+                && ny <= cam_y + 320 + 64;
+            if !in_view {
+                st.x = nx;
+                st.y = ny;
+                st.health = st.max_health;
+                st.action = 0;
+                if let Some(anim_set) = &st.anim_set {
+                    st.slot = anim::AnimSlot::new(anim_set, 0);
+                }
+            }
+        }
+        // Clear flag 4 for the trigger's tiles.
+        for y in trigger.tile_y..=trigger.tile_y + trigger.len as i32 {
+            self.flags.clear_flag(trigger.tile_x, y, 4);
         }
     }
 
@@ -936,9 +1199,19 @@ mod tests {
     /// the spawn-area prayer dialog fires on the
     /// player's start tile and would otherwise
     /// freeze every later tick in these tests.
-    fn drain_script(gp: &mut super::Gameplay) {
-        while gp.script.active() {
+    fn drain_script(gp: &mut super::Gameplay, res: &mut crate::resources::Resources) {
+        // Drain dialogs. A `!` cutscene (Phase 4)
+        // starts on advance; tick until it ends
+        // (it advances the script itself via C()).
+        let mut guard = 0;
+        while gp.script.active() && guard < 1000 {
+            guard += 1;
             gp.script_advance();
+            let mut cguard = 0;
+            while gp.cutscene_active && cguard < 1000 {
+                cguard += 1;
+                gp.tick(res, 0, false);
+            }
         }
     }
 
@@ -953,7 +1226,7 @@ mod tests {
         attack: bool,
     ) {
         gp.tick(res, dir, attack);
-        drain_script(gp);
+        drain_script(gp, res);
     }
 
     /// Phase 2: the boss bar latches on an `@`
@@ -1122,14 +1395,93 @@ mod tests {
             gp.script.dialog_text(),
             Some("The enemies in the temple were crushed, as Kratos continued his battle.")
         );
-        // One Select skips the '!' and hits '*'.
+        // One Select reaches the '!' cutscene step
+        // (Phase 4); tick until it ends (C()), then
+        // the '*' fires and the level completes.
         gp.script_advance();
+        assert!(gp.cutscene_active);
+        let mut guard = 0;
+        while gp.cutscene_active && guard < 1000 {
+            guard += 1;
+            gp.tick(&mut res, 0, false);
+        }
+        assert!(!gp.cutscene_active, "cutscene should end");
         assert_eq!(gp.level_complete, Some(1));
         // Neighbour tiles of the same script are spent.
         gp.player.ga = 214 * 16;
         gp.player.gb = 31 * 16;
         gp.tick(&mut res, 0, false);
         assert!(!gp.script.active());
+    }
+
+    #[test]
+    fn cutscene_plays_ay_action_then_ends() {
+        // Phase 4: a `!` step plays the type-6 aY
+        // table (state 105). Level 9217's aY[0] is
+        // action 96 (12 frames, repeat 3); the
+        // cutscene ends when it finishes (next aY
+        // is 0, no aZ target), and the script
+        // advances past the `!` step.
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        // The spawn tutorial opens with a `!` step
+        // (string 209), so the first tick starts it.
+        gp.tick(&mut res, 0, false);
+        assert!(gp.script.active());
+        assert!(gp.cutscene_active, "cutscene should start on the `!` step");
+        assert_eq!(gp.player.action, 96, "aY[0] = action 96");
+        // Tick until the cutscene ends (action 96
+        // is ~3 s at 40 ms/tick, so allow 200).
+        let mut guard = 0;
+        while gp.cutscene_active && guard < 200 {
+            guard += 1;
+            gp.tick(&mut res, 0, false);
+        }
+        assert!(!gp.cutscene_active, "cutscene should end after action 96");
+        // The script advanced past the `!` step to
+        // the next dialog (string 210).
+        assert!(gp.script.active());
+        assert_eq!(
+            gp.script.dialog_text(),
+            Some("God of War, we call on you!  Grant us strength!  ")
+        );
+    }
+
+    #[test]
+    fn flag4_respawn_refreshes_offscreen_enemy() {
+        // Phase 4, type-14: crossing a flag-4 tile
+        // updates off-screen enemies' spawn points
+        // and respawns them there at full health.
+        // Level 9217's trigger 1 is at tile
+        // (139, 18), len 8; its dY=0 entry is
+        // spawn (2400, 416).
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        // Pick the enemy with dY=0 (spawn 336,560)
+        // and wound it.
+        let st = gp.enemy_states.iter_mut().find(|s| s.enemy.dy == 0).unwrap();
+        st.health = 1;
+        let old_spawn = (st.enemy.x, st.enemy.y);
+        assert_eq!(old_spawn, (336, 560));
+        // Teleport the player onto the flag-4
+        // trigger tile (139, 18) and tick. The
+        // camera is set far away so the enemy is
+        // off-screen and actually respawns.
+        gp.player.ga = 139 * 16;
+        gp.player.gb = 18 * 16;
+        gp.player.cam_x = 139 * 16 - 120;
+        gp.player.cam_y = 18 * 16 - 266;
+        gp.tick(&mut res, 0, false);
+        let st = gp.enemy_states.iter().find(|s| s.enemy.dy == 0).unwrap();
+        assert_eq!((st.enemy.x, st.enemy.y), (2400, 416), "spawn point updated from the type-14 table");
+        assert_ne!((st.enemy.x, st.enemy.y), old_spawn);
+        // Off-screen, so it respawned there at full
+        // health and idle.
+        assert_eq!((st.x, st.y), (2400, 416));
+        assert_eq!(st.health, st.max_health);
+        assert_eq!(st.action, 0);
     }
 
     #[test]
@@ -1142,6 +1494,9 @@ mod tests {
         let mut res = crate::resources::Resources::new("../extracted");
         let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
         gp.dismiss_intro();
+        // Away from the spawn tutorial (its first
+        // step is a `!` cutscene, Phase 4).
+        gp.player.ga = 416;
         t(&mut gp, &mut res, 0, true);
         assert_eq!(gp.player.action, 54);
         assert_eq!(gp.player.combo_step, 1);
@@ -1180,6 +1535,9 @@ mod tests {
         let mut res = crate::resources::Resources::new("../extracted");
         let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
         gp.dismiss_intro();
+        // Away from the spawn tutorial (its first
+        // step is a `!` cutscene, Phase 4).
+        gp.player.ga = 416;
         t(&mut gp, &mut res, 0, true);
         assert_eq!(gp.player.action, 54);
         for _ in 0..2 {
@@ -1442,6 +1800,9 @@ mod tests {
         let mut res = crate::resources::Resources::new("../extracted");
         let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
         gp.dismiss_intro();
+        // Away from the spawn tutorial (its first
+        // step is a `!` cutscene, Phase 4).
+        gp.player.ga = 416;
         gp.magic = 256;
         gp.player.weapon_mode = 3;
         t(&mut gp, &mut res, 0, true);
@@ -1551,6 +1912,9 @@ mod tests {
         let mut res = crate::resources::Resources::new("../extracted");
         let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
         gp.dismiss_intro();
+        // Away from the spawn tutorial (its first
+        // step is a `!` cutscene, Phase 4).
+        gp.player.ga = 416;
         gp.block_held = true;
         t(&mut gp, &mut res, 0, false);
         assert_eq!(gp.player.action, 3);
@@ -1583,6 +1947,9 @@ mod tests {
         let mut res = crate::resources::Resources::new("../extracted");
         let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
         gp.dismiss_intro();
+        // Away from the spawn tutorial (its first
+        // step is a `!` cutscene, Phase 4).
+        gp.player.ga = 416;
         assert!(gp.jump());
         for _ in 0..10 {
             t(&mut gp, &mut res, 0, false);
@@ -1687,10 +2054,9 @@ mod tests {
                 continue;
             }
             gp.tick(&mut res, 1, false);
-            // Drain any script dialog that fires.
-            while gp.script.active() {
-                gp.script_advance();
-            }
+            // Drain any script dialog that fires
+            // (and any `!` cutscene, Phase 4).
+            drain_script(&mut gp, &mut res);
         }
         assert!(pulled, "the lever pull should have fired");
         assert!(gp.doors.iter().find(|d| d.id == 6).map(|d| d.open).unwrap_or(false), "pillar door should be open");

@@ -32,10 +32,17 @@
 //!   leaves every trigger tile.
 //!
 //! Port approximations (documented, not silent):
-//! - `!` cutscene steps auto-advance: the type-6 action
-//!   tables and state-105 cutscene playback are not
-//!   ported, so a `!` string plays no actions and costs
-//!   no input. Dialog steps still need one Select each.
+//! - `!` cutscene steps play the type-6 aY/aZ action
+//!   tables (Phase 4, state 105): the player's action
+//!   follows aY[ba] and the cutscene target enemy's
+//!   follows aZ[bb]; the world is frozen while the
+//!   cutscene plays, and it ends (C()) when the next
+//!   aY entry is 0 and the next aZ is 0 / no target.
+//!   The `ba`/`bb` indices persist across cutscenes
+//!   within a level (reset only on level load, D()).
+//!   The cutscene target `dL` is the enemy whose
+//!   spawn bit (extra[2]) is set; when no enemy has
+//!   it, the aZ table is skipped (player-only).
 //! - `^` weapon/magic switches are not applied (no
 //!   weapons in the port yet); the text after the
 //!   2-char `^` + digit prefix is shown as dialog.
@@ -83,6 +90,12 @@ pub enum ScriptEvent {
     /// (slice 23 / Phase 2): the caller should
     /// (re)set the boss-bar slot to the action.
     BossBarLatched,
+    /// A `!` cutscene step was reached (Phase 4):
+    /// the caller should start the cutscene
+    /// playback (type-6 aY/aZ tables, state 105).
+    /// The script stays active at this step until
+    /// the cutscene ends and the caller advances.
+    Cutscene,
     /// Nothing is showing (no active script).
     None,
 }
@@ -260,10 +273,13 @@ impl ScriptEngine {
                 return ScriptEvent::LevelComplete;
             }
             if text.starts_with('!') {
-                // Cutscene step: no actions ported,
-                // auto-advance without input.
-                self.active.as_mut().unwrap().current += 1;
-                continue;
+                // Cutscene step (Phase 4): the caller
+                // starts the state-105 playback from
+                // the type-6 aY/aZ tables. The script
+                // stays active at this step until the
+                // cutscene ends and the caller calls
+                // advance().
+                return ScriptEvent::Cutscene;
             }
             if text.starts_with('^') {
                 // Weapon/magic switch + dialog (slice
@@ -422,8 +438,11 @@ mod tests {
     }
 
     #[test]
-    fn bang_auto_advances_and_star_completes() {
+    fn bang_returns_cutscene_then_star_completes() {
         // Level-1 end script shape: [^dialog, !, *].
+        // Phase 4: the `!` step returns Cutscene
+        // (the caller plays it, then advances);
+        // a second advance past the cutscene hits '*'.
         let mut e = engine(
             vec![ScriptTrigger {
                 tile_x: 214,
@@ -437,7 +456,11 @@ mod tests {
             e.check_trigger(214, 30),
             ScriptEvent::Dialog("Temple crushed.".to_string())
         );
-        // One Select skips the '!' and hits '*'.
+        // One Select reaches the '!' cutscene step.
+        assert_eq!(e.advance(), ScriptEvent::Cutscene);
+        assert!(e.active());
+        // After the cutscene ends, the next advance
+        // hits '*'.
         assert_eq!(e.advance(), ScriptEvent::LevelComplete);
         assert!(!e.active());
     }

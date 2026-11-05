@@ -442,14 +442,27 @@ down, down, Select, Select, and draws the result to
   to Phase 6 (dX not ported). Magic does not regenerate yet
   (original: `hl += hn/64`/tick) — it comes only from MAGIC
   orbs. `cargo test`: 109/109. Windows cross-build OK
-  (2,482,068 bytes). Cargo version 0.7.0.
+  (2,482,068 bytes). Cargo version 0.7.0. v0.7.0 shipped
+  2026-11-05 ~15:20 IST (commit 5208b861, release tag v0.7.0).
+
+- Phase 4 DONE (2026-11-05): enemy AI depth + cutscenes +
+  respawn. The `eu` idle-to-walk timer (enemies pause a
+  random 0-511 ms before walking toward the player in
+  chase range, then re-randomise). Real `!` cutscene
+  playback (state 105): the type-6 aY/aZ tables play
+  (aY[0] = action 96 in level 9217), the world freezes,
+  and the script advances when the tables are exhausted
+  (`ba`/`bb` persist across cutscenes in a level). Flag-4
+  enemy respawn (type-14): crossing a flag-4 tile updates
+  off-screen enemies' spawn points and respawns them
+  there at full health. `cargo test`: 112/112. Windows
+  cross-build OK (2,495,296 bytes).
 
 ## Next steps (see ../REPORT.md)
-1. Phase 4: enemy AI depth + real '!' cutscene playback.
-2. Phase 5: menus & meta (in-game menu, settings, Arena waves,
+1. Phase 5: menus & meta (in-game menu, settings, Arena waves,
    level-placed collectibles, state-109 interstitial, lever pull
    animations, type-28 rectangle door triggers).
-3. Phase 6: combat polish (hurt reactions, block poses 27/28,
+2. Phase 6: combat polish (hurt reactions, block poses 27/28,
    fire-while-grabbing release, HUD weapon icon per mode).
 6. Phase 7: presentation, loose ends & v1.0.
 

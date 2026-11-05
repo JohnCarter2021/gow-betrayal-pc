@@ -673,6 +673,18 @@ fn main() {
                         // A latch never fires from advance
                         // (only from check_trigger).
                         script::ScriptEvent::BossBarLatched => {}
+                        // Cutscene (Phase 4): --play has no
+                        // cutscene player (that lives in
+                        // Gameplay), so auto-advance past
+                        // the `!` step here. The real
+                        // playback is in Gameplay (--game
+                        // and the live window).
+                        script::ScriptEvent::Cutscene => {
+                            let ev = script_engine.advance();
+                            if let script::ScriptEvent::Dialog(text) = ev {
+                                println!("script dialog: {text}");
+                            }
+                        }
                         script::ScriptEvent::None => {}
                     }
                     if let Some(mode) = script_engine.take_weapon_switch() {
@@ -732,7 +744,7 @@ fn main() {
                     for st in &mut enemy_states {
                         if let Ok(anim_chunk) = res.chunk(st.enemy.anim_id) {
                             if let Ok(anim_set) = anim::load_anim_set(&anim_chunk) {
-                                let dmg = st.tick(&anim_set, &flags, pl.ga, pl.gb);
+                                let dmg = st.tick(&anim_set, &flags, pl.ga, pl.gb, &mut orb_rng);
                                 if dmg > 0 {
                                     if pl.blocking {
                                         // Blocked hit: no damage,

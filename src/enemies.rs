@@ -40,6 +40,13 @@ pub struct Enemy {
     pub anim_id: u32,
     pub sprite_id: u32,
     pub action: usize,
+    /// Cutscene target `dL` (Phase 4): spawn bit
+    /// extra[2] — this enemy is the `!` cutscene's
+    /// aZ-table actor.
+    pub cutscene_target: bool,
+    /// Respawn-table index `dY` (Phase 4, extra[6]):
+    /// indexes the type-14 trigger's entries.
+    pub dy: i32,
 }
 
 pub fn enemies(parsed: &LevelEntities) -> Vec<Enemy> {
@@ -90,6 +97,8 @@ pub fn enemies(parsed: &LevelEntities) -> Vec<Enemy> {
                 anim_id,
                 sprite_id,
                 action: if ev { 1 } else { 0 },
+                cutscene_target: e[2] == 1,
+                dy: e[6] as i32,
             });
         }
     }
@@ -186,15 +195,56 @@ mod tests {
         let anim_data = std::fs::read("../extracted/RP18").unwrap();
         let anim_pack = crate::rp::parse_pack(&anim_data).unwrap();
         let anim = crate::anim::load_anim_set(&anim_pack.chunk(0).unwrap()).unwrap();
+        let mut rng = crate::pickups::OrbRng(1);
         let mut st = super::EnemyState::new(enemy, &anim);
         // Player 100 px to the right: within chase range (144).
-        // 20 ticks stay outside attack range (<48 px).
-        for _ in 0..20 {
-            st.tick(&anim, &flags, 436, 560);
+        // The `eu` timer (Phase 4) makes the enemy pause
+        // between walks, so run 60 ticks and assert it
+        // has moved right overall (not every tick).
+        for _ in 0..60 {
+            st.tick(&anim, &flags, 436, 560, &mut rng);
         }
         assert!(st.x > 336, "enemy should walk right toward player, got {}", st.x);
+    }
+    #[test]
+    fn eu_timer_idles_before_walking() {
+        // Phase 4: the `eu` idle-to-walk timer. An enemy
+        // in chase range with `eu >= 0` stays idle and
+        // `eu` drops by 40 per tick; once `eu < 0` it
+        // walks and `eu` re-randomises to 0..=511.
+        let data = std::fs::read("../extracted/RP9").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        let chunk = pack.chunk(1).unwrap();
+        let parsed = crate::entities::parse_level_entities(9217, &chunk).unwrap();
+        let flags = flags_9217(&parsed);
+        let list = super::enemies(&parsed);
+        let enemy = list.iter().find(|e| e.x == 336).unwrap().clone();
+        let anim_data = std::fs::read("../extracted/RP18").unwrap();
+        let anim_pack = crate::rp::parse_pack(&anim_data).unwrap();
+        let anim = crate::anim::load_anim_set(&anim_pack.chunk(0).unwrap()).unwrap();
+        let mut rng = crate::pickups::OrbRng(1);
+        let mut st = super::EnemyState::new(enemy, &anim);
+        // Set a large eu so the enemy must idle first.
+        st.eu = 200;
+        // Player in chase range (100 px right).
+        for _ in 0..5 {
+            st.tick(&anim, &flags, 436, 560, &mut rng);
+        }
+        // After 5 idle ticks eu dropped 200 -> 0 and the
+        // enemy has not moved.
+        assert_eq!(st.eu, 0);
+        assert_eq!(st.x, 336);
+        assert_eq!(st.action, 0);
+        // One more tick: eu 0 -> -40, still idle (eu < 0
+        // only gates the NEXT tick's walk).
+        st.tick(&anim, &flags, 436, 560, &mut rng);
+        assert_eq!(st.eu, -40);
+        assert_eq!(st.action, 0);
+        // Now eu < 0, so it walks and eu re-randomises.
+        st.tick(&anim, &flags, 436, 560, &mut rng);
         assert_eq!(st.action, 1);
-        assert!(st.facing_right);
+        assert!(st.x > 336, "enemy should walk after eu expires, got {}", st.x);
+        assert!(st.eu >= 0 && st.eu <= 511, "eu re-randomised to 0..=511, got {}", st.eu);
     }
     #[test]
     fn enemy_dies_after_enough_hits() {
@@ -208,6 +258,7 @@ mod tests {
         let anim_data = std::fs::read("../extracted/RP18").unwrap();
         let anim_pack = crate::rp::parse_pack(&anim_data).unwrap();
         let anim = crate::anim::load_anim_set(&anim_pack.chunk(0).unwrap()).unwrap();
+        let mut rng = crate::pickups::OrbRng(1);
         let mut st = super::EnemyState::new(enemy, &anim);
         assert!(!st.apply_damage(&anim, 2));
         assert_eq!(st.health, 1);
@@ -222,7 +273,7 @@ mod tests {
         // Advance until the animation finishes.
         let flags = flags_9217(&parsed);
         for _ in 0..100 {
-            st.tick(&anim, &flags, 436, 560);
+            st.tick(&anim, &flags, 436, 560, &mut rng);
             if st.dead {
                 break;
             }
@@ -243,6 +294,7 @@ mod tests {
         let anim_data = std::fs::read("../extracted/RP18").unwrap();
         let anim_pack = crate::rp::parse_pack(&anim_data).unwrap();
         let anim = crate::anim::load_anim_set(&anim_pack.chunk(0).unwrap()).unwrap();
+        let mut rng = crate::pickups::OrbRng(1);
         let mut st = super::EnemyState::new(enemy, &anim);
         assert!(!st.apply_damage(&anim, 2));
         assert_eq!(st.health, 11);
@@ -251,13 +303,13 @@ mod tests {
         // While staggering, the enemy neither attacks nor
         // moves, even with the player in attack range.
         let flags = flags_9217(&parsed);
-        let dmg = st.tick(&anim, &flags, 458, 560);
+        let dmg = st.tick(&anim, &flags, 458, 560, &mut rng);
         assert_eq!(dmg, 0);
         assert_eq!(st.action, 2);
         // Action 2 runs ~600 ms = 15 ticks; it must end
         // back at idle, alive.
         for _ in 0..30 {
-            st.tick(&anim, &flags, 458, 560);
+            st.tick(&anim, &flags, 458, 560, &mut rng);
             if st.action == 0 {
                 break;
             }
@@ -337,6 +389,19 @@ pub struct EnemyState {
     attack_count: usize,
     /// Damage per hit this enemy deals, `el` = extra[5].
     pub el: i32,
+    /// Idle-to-walk timer `eu` (Phase 4): when the
+    /// enemy is in chase range but idle, it waits
+    /// until `eu < 0` before walking; `eu` drops by
+    /// 40 per tick while idle, and is re-randomised
+    /// to 0..=511 when the enemy starts walking
+    /// (`i(1, ...)` sets `eu = O.nextInt() & 0x1FF`).
+    /// Starts 0 at spawn (so the first walk comes
+    /// after a single idle tick).
+    pub eu: i32,
+    /// The enemy's anim set (cloned at load, Phase 4):
+    /// lets the cutscene set the enemy's action to
+    /// an aZ-table entry without a Resources lookup.
+    pub anim_set: Option<anim::AnimSet>,
 }
 
 impl EnemyState {
@@ -358,6 +423,8 @@ impl EnemyState {
             attack_hit_done: false,
             attack_count: 0,
             el,
+            eu: 0,
+            anim_set: None,
             enemy,
         }
     }
@@ -419,14 +486,19 @@ impl EnemyState {
         false
     }
 
-    /// One tick. Returns damage dealt to the player this tick
-    /// (0 if no enemy attack hit landed).
+    /// One 40 ms tick: advance the current action,
+    /// decide the next one, and return the damage
+    /// this enemy deals to the player this tick (0
+    /// when it does not hit). `rng` supplies the
+    /// `eu` re-randomisation when the enemy starts
+    /// walking (Phase 4).
     pub fn tick(
         &mut self,
         anim_set: &anim::AnimSet,
         flags: &crate::player::TileFlags,
         player_x: i32,
         player_y: i32,
+        rng: &mut crate::pickups::OrbRng,
     ) -> i32 {
         if self.dead {
             return 0;
@@ -494,12 +566,31 @@ impl EnemyState {
             }
             return 0;
         }
-        let walk = if near_chase {
+        // Chase (Phase 4, `eu` idle-to-walk timer):
+        // the enemy idles until `eu < 0`, then walks
+        // and `eu` re-randomises to 0..=511 for the
+        // next idle. While idle in range, `eu` drops
+        // by 40 per tick.
+        if near_chase {
             if dx_player > 16 {
                 self.facing_right = true;
             } else if dx_player < -16 {
                 self.facing_right = false;
             }
+            if self.eu < 0 {
+                self.eu = (rng.next() & 0x1FF) as i32;
+                // Fall through to the walk below.
+            } else {
+                self.eu -= 40;
+                if self.action != 0 {
+                    self.action = 0;
+                    self.slot = anim::AnimSlot::new(anim_set, 0);
+                }
+                self.slot.advance(anim_set, 40);
+                return 0;
+            }
+        }
+        let walk = if near_chase {
             true
         } else if self.enemy.ev {
             // Patrol fallback for ev enemies when the player is far.
