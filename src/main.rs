@@ -18,6 +18,7 @@ mod pickups;
 mod script;
 mod boxes;
 mod doors;
+mod collectibles;
 #[cfg(feature = "window")]
 mod play_window;
 mod anim;
@@ -718,11 +719,14 @@ fn main() {
                     if block_held {
                         // Lever pull (slice 23): Down
                         // pressed near a type-34 lever
-                        // toggles its doors.
+                        // toggles its doors (Phase 5:
+                        // plays the pull animation 15/17).
                         if !prev_block_held && (pl.action == 0 || pl.action == 9) {
-                            if let Some(lx) = doors::check_lever(&mut play_levers, &mut play_doors, &mut flags, pl.ga, pl.gb) {
+                            if let Some((lx, action)) = doors::check_lever(&mut play_levers, &mut play_doors, &mut flags, pl.ga, pl.gb) {
                                 pl.ga = lx;
-                                println!("lever pulled, doors toggled");
+                                pl.action = action;
+                                pl.slot = anim::AnimSlot::new(&player_anim, action);
+                                println!("lever pulled, doors toggled (action {})", action);
                             }
                         }
                         if pl.action == 37 {

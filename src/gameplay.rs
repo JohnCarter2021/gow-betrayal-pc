@@ -61,6 +61,19 @@ pub struct Gameplay {
     pub pickups: crate::pickups::Pickups,
     pub gold: i32,
     pub magic: i32,
+    /// Max magic `hn = hp*192 + 1024` (Phase 5):
+    /// rises by 192 per magic upgrade (ft=3, fs=0).
+    pub max_magic: i32,
+    /// Health level `ho` (Phase 5): rises by 1 per
+    /// health upgrade (ft=3, fs>0); max health is
+    /// `ho*192 + 1024`.
+    pub health_level: i32,
+    /// Magic level `hp` (Phase 5): rises by 1 per
+    /// magic upgrade; max magic is `hp*192 + 1024`.
+    pub magic_level: i32,
+    /// Level-placed collectibles, type-4 (Phase 5):
+    /// orb bundles (ft 0-2) and upgrades (ft 3).
+    pub collectibles: Vec<crate::collectibles::Collectible>,
     rng: crate::pickups::OrbRng,
     /// Script triggers and playback (slice 13).
     pub script: ScriptEngine,
@@ -107,6 +120,10 @@ pub struct Gameplay {
     /// toggles its doors (the (206,32) lever opens
     /// the pillar door before the level end).
     pub levers: Vec<Lever>,
+    /// Type-28 rectangle door triggers (Phase 5):
+    /// standing on a flag-32 tile inside a rect
+    /// toggles its door (up to `count` times).
+    pub rect_triggers: Vec<doors::RectTrigger>,
     /// Down held on the previous tick (slice 23):
     /// a lever pull fires only on the press edge
     /// (block_held false -> true).
@@ -253,6 +270,8 @@ impl Gameplay {
         )?;
         // Type-34 levers (slice 23).
         let levers = doors::load_levers(&parsed);
+        // Type-28 rectangle door triggers (Phase 5).
+        let rect_triggers = doors::load_rect_triggers(&parsed);
         let mut triggers = Vec::new();
         if let Some(g8) = parsed.group(8) {
             for (i, &(px, py)) in g8.positions.iter().enumerate() {
@@ -323,6 +342,9 @@ impl Gameplay {
                 });
             }
         }
+        // Level-placed collectibles, type-4 (Phase 5).
+        // Loaded before `parsed` moves into the struct.
+        let collectibles = crate::collectibles::load_collectibles(&parsed);
         Ok(Gameplay {
             parsed,
             flags,
@@ -337,6 +359,15 @@ impl Gameplay {
             pickups: crate::pickups::Pickups::default(),
             gold: 0,
             magic: 0,
+            // Maxima from the save levels (Phase 5):
+            // ho/hp are 0 on a fresh save, so both
+            // maxima start at 1024. `Game::load` (game.rs)
+            // overwrites these from the save after load.
+            max_magic: 1024,
+            health_level: 0,
+            magic_level: 0,
+            // Level-placed collectibles, type-4 (Phase 5).
+            collectibles,
             // Time-based seed; exact scatter does not
             // matter for gameplay, only for tests (which
             // seed their own rng).
@@ -359,6 +390,7 @@ impl Gameplay {
             switches,
             doors,
             levers,
+            rect_triggers,
             prev_block_held: false,
             prev_dir: 0,
             cutscene_ay,
@@ -403,7 +435,7 @@ impl Gameplay {
                             (self.player.health + value).min(self.player.max_health);
                     }
                     crate::pickups::MAGIC => {
-                        self.magic = (self.magic + value).min(1024);
+                        self.magic = (self.magic + value).min(self.max_magic);
                     }
                     _ => {}
                 },
@@ -727,12 +759,14 @@ impl Gameplay {
         // Down held while holding on a wall (slice
         // 21) climbs down (34) or drops (26) instead.
         if self.block_held {
-            // Lever pull (slice 23): Down pressed near
-            // a type-34 lever toggles its doors. Fires
+            // Lever pull (slice 23, Phase 5): Down
+            // pressed near a type-34 lever toggles its
+            // doors and plays the pull animation
+            // (action 15 pull / 17 un-pull). Fires
             // only on the press edge, while grounded.
             let down_edge = !self.prev_block_held;
             if down_edge && (self.player.action == 0 || self.player.action == 9) {
-                if let Some(lx) = doors::check_lever(
+                if let Some((lx, action)) = doors::check_lever(
                     &mut self.levers,
                     &mut self.doors,
                     &mut self.flags,
@@ -740,6 +774,8 @@ impl Gameplay {
                     self.player.gb,
                 ) {
                     self.player.ga = lx;
+                    self.player.action = action;
+                    self.player.slot = anim::AnimSlot::new(&self.player_anim, action);
                 }
             }
             if self.player.action == 37 {
@@ -957,6 +993,44 @@ impl Gameplay {
             // crossing a flag-4 tile refreshes
             // off-screen enemies to new spawn points.
             self.check_respawn(tx, ty);
+            // Type-28 rectangle door trigger (Phase 5):
+            // standing on a flag-32 tile inside a
+            // rect toggles its door (up to count times).
+            doors::check_rect_trigger(
+                &mut self.rect_triggers,
+                &mut self.doors,
+                &mut self.flags,
+                tx,
+                ty,
+            );
+            // Type-4 collectibles (Phase 5): touching
+            // an uncollected item picks it up (orb
+            // bundles spawn orbs; upgrades raise the
+            // max and refill). The player plays the
+            // pickup pose (action 31).
+            if let Some(out) = crate::collectibles::check_collectible(
+                &mut self.collectibles,
+                self.player.ga,
+                self.player.gb,
+            ) {
+                self.player.action = 31;
+                self.player.slot = anim::AnimSlot::new(&self.player_anim, 31);
+                match out {
+                    crate::collectibles::CollectOutcome::Orbs { kind, value, x, y } => {
+                        self.pickups.spawn(x, y, kind, value, &mut self.rng);
+                    }
+                    crate::collectibles::CollectOutcome::HealthUpgrade => {
+                        self.health_level += 1;
+                        self.player.max_health = self.health_level * 192 + 1024;
+                        self.player.health = self.player.max_health;
+                    }
+                    crate::collectibles::CollectOutcome::MagicUpgrade => {
+                        self.magic_level += 1;
+                        self.max_magic = self.magic_level * 192 + 1024;
+                        self.magic = self.max_magic;
+                    }
+                }
+            }
         }
     }
 
@@ -2028,6 +2102,104 @@ mod tests {
     /// (213,32); then walk through to the level-end
     /// trigger at tile 214 (cn=175) and
     /// `level_complete` is set.
+    #[test]
+    fn lever_pull_plays_action_15_then_returns_to_idle() {
+        // Phase 5: pulling the temple lever plays
+        // the pull animation (15) and the pillar
+        // door opens; the animation plays out to idle.
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        gp.player.ga = 206 * 16 + 8;
+        gp.player.gb = 32 * 16;
+        gp.player.action = 0;
+        // Press Down (block_held) — the lever fires
+        // on the press edge, while grounded.
+        gp.block_held = true;
+        gp.tick(&mut res, 0, false);
+        assert_eq!(gp.player.action, 15, "pull plays action 15");
+        let door = gp.doors.iter().find(|d| d.id == 6).unwrap();
+        assert!(door.open, "pillar door opens on the pull");
+        // Tick until the 13-frame pull finishes.
+        let mut n = 0;
+        while gp.player.action != 0 && n < 100 {
+            gp.tick(&mut res, 0, false);
+            n += 1;
+        }
+        assert_eq!(gp.player.action, 0, "pull returns to idle");
+    }
+
+    #[test]
+    fn rect_trigger_toggles_door_up_to_count() {
+        // Phase 5, type-28: level 9217 rect 1 is
+        // tile (81,28) w=22 h=8, door 5, count 1.
+        // Standing on a flag-32 tile inside it
+        // toggles door 5 once, then never again.
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        let trig = gp.rect_triggers.iter().find(|t| t.door_id == 5).unwrap();
+        assert_eq!((trig.x, trig.y, trig.w, trig.h, trig.count), (81, 28, 22, 8, 1));
+        assert!(gp.flags.get(90, 30) & 32 != 0, "flag 32 set inside the rect");
+        let door_before = gp.doors.iter().find(|d| d.id == 5).map(|d| d.open);
+        gp.player.ga = 90 * 16;
+        gp.player.gb = 30 * 16;
+        gp.tick(&mut res, 0, false);
+        let door_after = gp.doors.iter().find(|d| d.id == 5).map(|d| d.open);
+        assert_ne!(door_before, door_after, "door 5 toggles on entry");
+        // Staying in the rect (cooldown + count 1)
+        // does not toggle it again.
+        for _ in 0..60 {
+            gp.tick(&mut res, 0, false);
+        }
+        let door_later = gp.doors.iter().find(|d| d.id == 5).map(|d| d.open);
+        assert_eq!(door_after, door_later, "count-1 trigger fires only once");
+    }
+
+    #[test]
+    fn collectible_orb_bundle_spawns_orbs() {
+        // Phase 5, type-4: level 9217's gold bundle
+        // at tile (189,8) is ft=0 value 200. Touching
+        // it spawns gold orbs totalling 200 and plays
+        // the pickup pose (31).
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        gp.player.ga = 189 * 16;
+        gp.player.gb = 8 * 16 + 8;
+        gp.player.action = 0;
+        gp.tick(&mut res, 0, false);
+        assert_eq!(gp.player.action, 31, "pickup pose plays");
+        let total: i32 = gp.pickups.orbs.iter().filter(|o| o.kind == crate::pickups::GOLD).map(|o| o.value).sum();
+        assert_eq!(total, 200, "gold orbs total 200");
+        // The item is now collected; touching again
+        // spawns nothing more.
+        let before = gp.pickups.orbs.len();
+        gp.player.action = 0;
+        gp.tick(&mut res, 0, false);
+        assert_eq!(gp.pickups.orbs.len(), before, "collected item does not re-spawn");
+    }
+
+    #[test]
+    fn collectible_upgrade_raises_max_and_refills() {
+        // Phase 5, type-4: level 19456's health
+        // upgrade at tile (91,12) is ft=3 fs=1.
+        // Touching it raises max health by 192 and
+        // refills health to the new max.
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 19456, false).unwrap();
+        gp.dismiss_intro();
+        assert_eq!(gp.player.max_health, 1024);
+        gp.player.health = 500;
+        gp.player.ga = 91 * 16;
+        gp.player.gb = 12 * 16 + 8;
+        gp.player.action = 0;
+        gp.tick(&mut res, 0, false);
+        assert_eq!(gp.health_level, 1);
+        assert_eq!(gp.player.max_health, 1216, "ho 0->1 raises max to 1216");
+        assert_eq!(gp.player.health, 1216, "health refills to the new max");
+    }
+
     #[test]
     fn gameplay_temple_floor_to_level_end() {
         let mut res = crate::resources::Resources::new("../extracted");

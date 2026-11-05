@@ -251,21 +251,113 @@ fn toggle_doors_by_id(doors: &mut [Door], flags: &mut TileFlags, ids: &[u32]) {
 /// centre), snap the player to the lever's x,
 /// flip the lever, and toggle its doors. Returns
 /// true when a lever was pulled.
+/// Type-28 rectangle door trigger (Phase 5).
+/// `x`/`y` are the top-left tile (`da`/`db`),
+/// `w`/`h` the size in tiles (`dc`/`dd`, inclusive),
+/// `door_id` the door it toggles (`de`, m(3)),
+/// `count` the fire limit (`dg`, m(10)) — the
+/// trigger fires at most `count` times, and only
+/// when `count > 0`. `fired` is `df` (starts 0);
+/// `cooldown_ms` is `gK` (2000 ms after each fire).
+pub struct RectTrigger {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub door_id: u32,
+    pub count: u32,
+    pub fired: u32,
+    pub cooldown_ms: i32,
+}
+
+/// Load the type-28 rectangle triggers from the
+/// parsed level (group 28: positions are px;
+/// extras are `[dc, dd, de, dg]` per item).
+pub fn load_rect_triggers(parsed: &LevelEntities) -> Vec<RectTrigger> {
+    let Some(group) = parsed.group(28) else {
+        return Vec::new();
+    };
+    group
+        .positions
+        .iter()
+        .enumerate()
+        .map(|(i, &(px, py))| RectTrigger {
+            x: px / 16,
+            y: py / 16,
+            w: group.extra.get(i * 4).copied().unwrap_or(0) as i32,
+            h: group.extra.get(i * 4 + 1).copied().unwrap_or(0) as i32,
+            door_id: group.extra.get(i * 4 + 2).copied().unwrap_or(0),
+            count: group.extra.get(i * 4 + 3).copied().unwrap_or(0),
+            fired: 0,
+            cooldown_ms: 0,
+        })
+        .collect()
+}
+
+/// Type-28 rectangle trigger (Phase 5): when the
+/// player stands on a flag-32 tile inside a
+/// rectangle, and the trigger still has fires
+/// left (`fired < count`, `count > 0`) and its
+/// cooldown has expired, toggle the door `de`
+/// and start the 2-second cooldown (`gK = 2000`).
+/// Call once per tick with the player's tile;
+/// the cooldown decrements by 40 ms per call.
+/// Returns the door id toggled, if any.
+pub fn check_rect_trigger(
+    triggers: &mut [RectTrigger],
+    doors: &mut [Door],
+    flags: &mut TileFlags,
+    tile_x: i32,
+    tile_y: i32,
+) -> Option<u32> {
+    for trig in triggers.iter_mut() {
+        if trig.cooldown_ms > 0 {
+            trig.cooldown_ms -= 40;
+        }
+        if tile_x < trig.x || tile_x > trig.x + trig.w || tile_y < trig.y || tile_y > trig.y + trig.h {
+            continue;
+        }
+        if flags.get(tile_x, tile_y) & 32 == 0 {
+            continue;
+        }
+        if trig.count == 0 || trig.fired >= trig.count || trig.cooldown_ms > 0 {
+            continue;
+        }
+        trig.fired += 1;
+        trig.cooldown_ms = 2000;
+        let ids = [trig.door_id];
+        toggle_doors_by_id(doors, flags, &ids);
+        return Some(trig.door_id);
+    }
+    None
+}
+
+/// Lever pull (Phase 5): when the player presses
+/// Down near a type-34 lever, the lever flips and
+/// its doors toggle. Returns `(snap_x, action)`:
+/// the player snaps to the lever x and plays the
+/// pull animation — action 15 when the lever was
+/// un-pulled (`!cD`), action 17 when it was pulled
+/// (`cD`), matching `s(15)` / `s(17)` in e.java.
+/// The doors toggle at once (the original flips
+/// `cD` in the same tick); the animation is
+/// cosmetic and plays out to idle.
 pub fn check_lever(
     levers: &mut [Lever],
     doors: &mut [Door],
     flags: &mut TileFlags,
     ga: i32,
     gb: i32,
-) -> Option<i32> {
+) -> Option<(i32, usize)> {
     for lever in levers.iter_mut() {
         let lx = lever.x * 16 + 8;
         let ly = lever.y * 16;
         if (ga - lx).abs() <= 16 && (gb - ly).abs() <= 32 {
+            let action = if lever.flipped { 17 } else { 15 };
             lever.flipped = !lever.flipped;
             let ids = lever.door_ids;
             toggle_doors_by_id(doors, flags, &ids);
-            return Some(lx);
+            return Some((lx, action));
         }
     }
     None
@@ -363,13 +455,13 @@ mod tests {
         assert!(flags.solid(213, 30), "pillar footprint solid before the pull");
         // The player on the temple floor at the lever.
         let snap = check_lever(&mut levers, &mut doors, &mut flags, 206 * 16 + 8, 32 * 16);
-        assert_eq!(snap, Some(206 * 16 + 8), "player snaps to the lever x");
+        assert_eq!(snap, Some((206 * 16 + 8, 15)), "player snaps to the lever x and plays pull (15)");
         let door = doors.iter().find(|d| d.id == 6).expect("door id 6");
         assert!(door.open, "pillar door opens after the pull");
         assert!(!flags.solid(213, 30) && !flags.solid(214, 32), "pillar footprint cleared");
         // Pulling again closes it.
         let snap = check_lever(&mut levers, &mut doors, &mut flags, 206 * 16 + 8, 32 * 16);
-        assert_eq!(snap, Some(206 * 16 + 8));
+        assert_eq!(snap, Some((206 * 16 + 8, 17)), "second pull plays un-pull (17)");
         let door = doors.iter().find(|d| d.id == 6).expect("door id 6");
         assert!(!door.open, "pillar door closes on the second pull");
     }

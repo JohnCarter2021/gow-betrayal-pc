@@ -551,7 +551,10 @@ impl Game {
             // Combo caps/shifts come from the save
             // (slice 16: gN/gP; slice 17: gO/gQ for
             // Artemis). Magic levels too (Phase 3:
-            // gV for mode 2, gW for mode 3).
+            // gV for mode 2, gW for mode 3). Health/
+            // magic upgrade levels (Phase 5: ho/hp)
+            // set the maxima: hm = ho*192+1024,
+            // hn = hp*192+1024.
             if let Some(gp) = &mut self.gameplay {
                 gp.set_strings(self.strings.clone());
                 gp.player.combo_max = self.save.g_n;
@@ -560,6 +563,10 @@ impl Game {
                 gp.player.combo_shift_artemis = self.save.g_q;
                 gp.player.magic_level_mode2 = self.save.g_v;
                 gp.player.magic_level_mode3 = self.save.g_w;
+                gp.health_level = self.save.ho;
+                gp.magic_level = self.save.hp;
+                gp.player.max_health = self.save.ho * 192 + 1024;
+                gp.max_magic = self.save.hp * 192 + 1024;
             }
         }
     }

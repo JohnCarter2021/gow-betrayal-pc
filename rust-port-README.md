@@ -456,12 +456,25 @@ down, down, Select, Select, and draws the result to
   enemy respawn (type-14): crossing a flag-4 tile updates
   off-screen enemies' spawn points and respawns them
   there at full health. `cargo test`: 112/112. Windows
-  cross-build OK (2,495,296 bytes).
+  cross-build OK (2,495,363 bytes).
+
+- Phase 5 PARTIAL (2026-11-05): lever pull animations
+  (Down near a lever plays action 15 pull / 17 un-pull,
+  doors toggle at once); type-28 rectangle door triggers
+  (standing on a flag-32 tile inside a rect toggles its
+  door, up to `count` times, 2 s cooldown); level-placed
+  collectibles (type-4: gold/health/magic orb bundles
+  totalling `fs`, and upgrades — ft=3 raises max health
+  or magic by 192 and refills). `cargo test`: 119/119.
+  Windows cross-build OK (2,499,230 bytes). Deferred:
+  in-game menu/pause (state 102), settings store "-9",
+  Arena waves/scoring, state-109 interstitial, state-104
+  upgrade interstitial.
 
 ## Next steps (see ../REPORT.md)
-1. Phase 5: menus & meta (in-game menu, settings, Arena waves,
-   level-placed collectibles, state-109 interstitial, lever pull
-   animations, type-28 rectangle door triggers).
+1. Phase 5 (rest): in-game menu/pause (state 102),
+   settings store "-9", Arena waves/scoring, state-109
+   interstitial.
 2. Phase 6: combat polish (hurt reactions, block poses 27/28,
    fire-while-grabbing release, HUD weapon icon per mode).
 6. Phase 7: presentation, loose ends & v1.0.

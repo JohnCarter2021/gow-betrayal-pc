@@ -1133,6 +1133,25 @@ impl Player {
             self.update_camera(target_x, target_y, level_w, level_h);
             return 0;
         }
+        if self.action == 15 || self.action == 17 || self.action == 31 {
+            // Lever pull (Phase 5): one-shot pull
+            // (15, 13 frames) / un-pull (17, 7 frames)
+            // animations. The doors already toggled
+            // at pull time; when the animation
+            // finishes, return to idle.
+            // Pickup pose (Phase 5, action 31): plays
+            // when a type-4 collectible is touched;
+            // the orbs / upgrade were granted at once.
+            self.slot.advance(anim, 40);
+            if self.slot.repeat == 0 {
+                self.action = 0;
+                self.slot = AnimSlot::new(anim, 0);
+            }
+            let target_x = self.ga - 120 + if self.facing_right { 60 } else { -60 };
+            let target_y = self.gb - 266;
+            self.update_camera(target_x, target_y, level_w, level_h);
+            return 0;
+        }
         if self.action == 94 {
             // Mode-2 channeled cast (Phase 3): a
             // looping 16-frame animation (repeat 63).

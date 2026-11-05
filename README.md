@@ -2,14 +2,14 @@
 
 A Rust PC port, in progress, of *God of War: Betrayal* (J2ME, Glu Mobile, v1.4.8).
 
-Status, 2026-11-05 — v0.8.0: everything in v0.7.0, plus Phase 4
-(enemy AI depth + cutscenes + respawn: the `eu` idle-to-walk
-timer — enemies pause a random 0-511 ms before walking toward
-you in chase range; real `!` cutscene playback — the type-6
-aY/aZ action tables play with the world frozen, e.g. the spawn
-tutorial opens with action 96; flag-4 enemy respawn — crossing
-a flag-4 tile refreshes off-screen enemies to new spawn points
-at full health):
+Status, 2026-11-05 — v0.9.0: everything in v0.8.0, plus Phase 5
+(partial: lever pull animations — Down near a lever plays action
+15 pull / 17 un-pull while the doors toggle; type-28 rectangle
+door triggers — standing on a flag-32 tile inside a rect toggles
+its door, up to `count` times, 2 s cooldown; level-placed
+collectibles — type-4 gold/health/magic orb bundles totalling
+`fs`, and ho/hp upgrades that raise max health/magic by 192 and
+refill):
 
 - **MIDP shim, std-only, no crates:** 240×320 framebuffer, `Graphics`
   (clip / translate / `drawRegion` with all 8 MIDP transforms), sprite
