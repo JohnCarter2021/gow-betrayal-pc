@@ -175,6 +175,12 @@ pub struct Game {
     /// Down press in scripted modes); drives the
     /// block stance via Gameplay.block_held.
     pub held_down: bool,
+    /// Key code of the most recent discrete press
+    /// (Phase 8, the grapple mash): set from the
+    /// Input in update (or by the window on a
+    /// press edge) and copied into Gameplay by
+    /// gameplay_tick; 0 when there is no press.
+    pub key_code: i32,
 }
 
 impl Game {
@@ -222,6 +228,7 @@ impl Game {
             gameplay: None,
             held_dir: 0,
             held_down: false,
+            key_code: 0,
         }
     }
 
@@ -520,6 +527,9 @@ impl Game {
                 // main menu (softkey Menu, not yet a pause screen in
                 // the original either - it opens the in-game menu,
                 // state 102, which is not ported yet).
+                // Record the key code (Phase 8): the grapple
+                // mash reads it from Gameplay.
+                self.key_code = input.s_code();
                 match input {
                     Input::Select => {
                         if let Some(gp) = &mut self.gameplay {
@@ -872,6 +882,8 @@ impl Game {
         if let Some(gp) = &mut self.gameplay {
             let dir = self.held_dir;
             gp.block_held = self.held_down;
+            gp.key_code = self.key_code;
+            self.key_code = 0;
             gp.tick(&mut self.res, dir, false);
         }
         self.handle_level_complete();
@@ -882,6 +894,8 @@ impl Game {
         if let Some(gp) = &mut self.gameplay {
             let dir = self.held_dir;
             gp.block_held = self.held_down;
+            gp.key_code = self.key_code;
+            self.key_code = 0;
             gp.tick(&mut self.res, dir, true);
         }
         self.handle_level_complete();

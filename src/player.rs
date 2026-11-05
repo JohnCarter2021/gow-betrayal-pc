@@ -277,6 +277,25 @@ pub struct CameraZone {
     pub negative: bool,
 }
 
+/// A type-7 camera zone (Phase 8, e.java:3193
+/// loader + 1588 camera): a horizontal-only
+/// zone. `x`/`y` are the `fd`/`fe` px point,
+/// `half_w` is `ff` (half the zone sprite's
+/// width, from set 2048 action `fa`), `enabled`
+/// is `fj`, `negative` is `fk`. When enabled and
+/// the point `(x + half_w if negative, y)` is in
+/// the viewport, the camera offset `aI` steps
+/// toward `negative` and snaps so the point
+/// stays in view.
+#[derive(Debug, Clone, Copy)]
+pub struct CameraZone7 {
+    pub x: i32,
+    pub y: i32,
+    pub half_w: i32,
+    pub enabled: bool,
+    pub negative: bool,
+}
+
 /// Camera-zone offset step (`aK * L >> 8`).
 pub const CAMERA_ZONE_STEP: i32 = 7;
 
@@ -297,6 +316,9 @@ pub struct Player {
     pub cam_zone_j: i32,
     /// Type-3 camera zones for the current level.
     pub camera_zones: Vec<CameraZone>,
+    /// Type-7 camera zones (Phase 8): horizontal
+    /// only, from `entities::camera_zones_7`.
+    pub camera_zones_7: Vec<CameraZone7>,
     /// Player health `hj`, max `hm` = 1024, as in `t()`
     /// (hk = hj = hm at level start).
     pub health: i32,
@@ -426,6 +448,7 @@ impl Player {
             cam_zone_i: 0,
             cam_zone_j: 0,
             camera_zones: Vec::new(),
+            camera_zones_7: Vec::new(),
         }
     }
 
@@ -438,10 +461,50 @@ impl Player {
         self.camera_zones = zones;
     }
 
+    /// Set the type-7 camera zones for the level
+    /// (Phase 8), from `entities::camera_zones_7`.
+    pub fn set_camera_zones_7(&mut self, zones: Vec<CameraZone7>) {
+        self.camera_zones_7 = zones;
+    }
+
     /// True while the player holds a box (the grab pose
     /// 21 or a push/pull 22/23, slice 22).
     pub fn grabbing(&self) -> bool {
         matches!(self.action, 21 | 22 | 23)
+    }
+
+    /// Anim action for a logical action (Phase 8,
+    /// e.java `s()`): when the Blade of Artemis is
+    /// equipped (`hb = (fM == 1)`, i.e. weapon_mode
+    /// 1), some actions play a variant animation
+    /// while `player.action` stays the logical one:
+    /// 27->29, 3->4, 97->98, 5->6, 8->9, 100->101,
+    /// 38->39. All other actions (and all actions
+    /// with the blades or magic modes) play as-is.
+    pub fn anim_action(action: usize, weapon_mode: i32) -> usize {
+        if weapon_mode != 1 {
+            return action;
+        }
+        match action {
+            27 => 29,
+            3 => 4,
+            97 => 98,
+            5 => 6,
+            8 => 9,
+            100 => 101,
+            38 => 39,
+            _ => action,
+        }
+    }
+
+    /// Set the player's action and (re)create its
+    /// anim slot with the Artemis variant applied
+    /// (see `anim_action`). Use this wherever the
+    /// player's action changes, so the variant is
+    /// never skipped.
+    pub fn set_action(&mut self, anim: &AnimSet, action: usize) {
+        self.action = action;
+        self.slot = AnimSlot::new(anim, Self::anim_action(action, self.weapon_mode));
     }
 
     /// Ground-attack actions: normal blades
@@ -663,8 +726,7 @@ impl Player {
         // (action 37) vaults onto the ledge (38) — the
         // `g()` top-out `s(38)` after a `s(37)` hang.
         if self.action == 37 {
-            self.action = 38;
-            self.slot = AnimSlot::new(anim, 38);
+            self.set_action(anim, 38);
             self.h_k = 0;
             self.h_l = 0;
             return true;
@@ -877,8 +939,7 @@ impl Player {
         // another climb cycle — the `g()` branch
         // `gu && b < 0 -> s(38)`.
         if self.climbing_top {
-            self.action = 38;
-            self.slot = AnimSlot::new(anim, 38);
+            self.set_action(anim, 38);
             self.climbing_top = false;
             return true;
         }
@@ -1045,8 +1106,7 @@ impl Player {
         if self.action != 0 && self.action != 9 {
             return false;
         }
-        self.action = 27;
-        self.slot = AnimSlot::new(anim, 27);
+        self.set_action(anim, 27);
         self.blocking = true;
         true
     }
@@ -1085,7 +1145,7 @@ impl Player {
         } else {
             self.action = 100;
         }
-        self.slot = AnimSlot::new(anim, self.action);
+        self.slot = AnimSlot::new(anim, Self::anim_action(self.action, self.weapon_mode));
     }
 
     /// One 40 ms tick. `dir`: -1 left, 0 none, +1 right.
@@ -1161,8 +1221,7 @@ impl Player {
             self.slot.advance(anim, 40);
             if self.slot.repeat == 0 {
                 if self.blocking {
-                    self.action = 3;
-                    self.slot = AnimSlot::new(anim, 3);
+                    self.set_action(anim, 3);
                 } else {
                     self.action = 28;
                     self.slot = AnimSlot::new(anim, 28);
@@ -1197,7 +1256,7 @@ impl Player {
             self.slot.advance(anim, 40);
             if self.slot.repeat == 0 {
                 if self.blocking {
-                    self.slot = AnimSlot::new(anim, 3);
+                    self.slot = AnimSlot::new(anim, Self::anim_action(3, self.weapon_mode));
                 } else {
                     self.action = 28;
                     self.slot = AnimSlot::new(anim, 28);
@@ -1237,6 +1296,26 @@ impl Player {
             let (dx, _dy) = self.slot.advance(anim, 40);
             self.ga += if self.facing_right { dx } else { -dx };
             if self.slot.repeat == 0 {
+                self.action = 0;
+                self.slot = AnimSlot::new(anim, 0);
+            }
+            let target_x = self.ga - 120 + if self.facing_right { 60 } else { -60 };
+            let target_y = self.gb - 266;
+            self.update_camera(target_x, target_y, level_w, level_h);
+            return dx;
+        }
+        if matches!(self.action, 12 | 88 | 91 | 113 | 114 | 117) {
+            // Grapple / finisher / throw (Phase 8):
+            // one-shot poses with root motion. The
+            // grapple actions (88/91) do NOT return
+            // to idle here — Gameplay resolves the
+            // mini-game (success 89/92, fail 90/93)
+            // when the animation ends. The finisher
+            // (12) and throws (113/114/117) return
+            // to idle when they end.
+            let (dx, _dy) = self.slot.advance(anim, 40);
+            self.ga += if self.facing_right { dx } else { -dx };
+            if self.slot.repeat == 0 && !matches!(self.action, 88 | 91) {
                 self.action = 0;
                 self.slot = AnimSlot::new(anim, 0);
             }
@@ -1815,6 +1894,38 @@ impl Player {
                 }
             }
         }
+        // Type-7 zones (Phase 8, e.java:1588-1599):
+        // horizontal-only. When enabled and the
+        // point `(x + half_w if negative, y)` is in
+        // the viewport, the horizontal offset steps
+        // toward `negative` and snaps so the point
+        // stays in view. An active zone also holds
+        // the offset (sets `horiz`, so the decay
+        // below does not run).
+        for zone in &self.camera_zones_7 {
+            if !zone.enabled {
+                continue;
+            }
+            let px = zone.x + if zone.negative { zone.half_w } else { 0 };
+            let in_view = px >= self.cam_x
+                && px < self.cam_x + 240
+                && zone.y >= self.cam_y
+                && zone.y < self.cam_y + 320;
+            if !in_view {
+                continue;
+            }
+            horiz = true;
+            if zone.negative {
+                self.cam_zone_i -= step;
+            } else {
+                self.cam_zone_i += step;
+            }
+            let in_view2 = px >= self.cam_x + self.cam_zone_i
+                && px < self.cam_x + self.cam_zone_i + 240;
+            if !in_view2 {
+                self.cam_zone_i = px - self.cam_x - if zone.negative { 240 } else { 0 };
+            }
+        }
         if !horiz && self.cam_zone_i != 0 {
             if self.cam_zone_i > 0 {
                 self.cam_zone_i -= step;
@@ -1914,6 +2025,68 @@ mod tests {
         assert!(!vert.negative, "row zones are positive (aG=0)");
         let row26 = zones.iter().find(|z| z.vertical && z.y == 26 * 16).expect("a vertical zone on row 26");
         assert!(!row26.negative, "row-26 zones are positive");
+    }
+
+    /// Phase 8: type-7 camera zones load from the
+    /// level. Most zones are disabled (`fj` = 0);
+    /// 24576 has one enabled, negative zone at
+    /// (992,256) with extras `[fa=3, fj=1, fk=1]`.
+    /// The half width comes from the zone sprite
+    /// (anim set 2048 action `fa`, sprite set
+    /// 2051) — here it is a real frame, so the
+    /// half width is positive.
+    #[test]
+    fn camera_zones_7_load_for_level_24576() {
+        let data = std::fs::read("../extracted/RP24").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        let chunk = pack.chunk(0).unwrap();
+        let parsed = crate::entities::parse_level_entities(24576, &chunk).unwrap();
+        let zones = crate::entities::camera_zones_7(&parsed);
+        assert_eq!(zones.len(), 1, "type-7 count {}", zones.len());
+        let (x, y, action, enabled, negative) = zones[0];
+        assert_eq!((x, y), (992, 256), "type-7 point");
+        assert_eq!(action, 3, "fa is the anim action");
+        assert!(enabled, "fj is set for the 24576 zone");
+        assert!(negative, "fk is set for the 24576 zone");
+        // The zone's sprite frame (anim 2048 action
+        // `fa`, sprite set 2051) has a real width.
+        let anim_data = std::fs::read("../extracted/RP2").unwrap();
+        let anim_pack = crate::rp::parse_pack(&anim_data).unwrap();
+        let anim_set =
+            crate::anim::load_anim_set(&anim_pack.chunk(0).unwrap()).unwrap();
+        let mut res = crate::resources::Resources::new("../extracted");
+        let sprites = res.sprite_set(2051, None).unwrap();
+        let frames = crate::anim::frames_for_timeline_frame(&anim_set, action, 0, 0)
+            .unwrap();
+        let fr = frames.first().unwrap();
+        let half_w = sprites.frames[fr.sprite_idx].w / 2;
+        assert!(half_w > 0, "zone sprite has a width");
+        // Wiring it into the player moves the
+        // camera offset while the zone is in view.
+        let mut pl = super::Player::new(
+            &crate::anim::load_anim_set(
+                &crate::rp::parse_pack(
+                    &std::fs::read("../extracted/RP28").unwrap(),
+                )
+                .unwrap()
+                .chunk(0)
+                .unwrap(),
+            )
+            .unwrap(),
+            (992, 256),
+            true,
+            872,
+            0,
+        );
+        pl.set_camera_zones_7(vec![super::CameraZone7 {
+            x,
+            y,
+            half_w,
+            enabled,
+            negative,
+        }]);
+        pl.update_camera_zones();
+        assert_ne!(pl.cam_zone_i, 0, "type-7 zone shifts the camera offset");
     }
 
     /// Slice 23: a horizontal zone in view shifts the
@@ -2686,6 +2859,35 @@ mod tests {
         pl.hurt_reaction(&anim, 60, false);
         assert_eq!(pl.action, 7);
         assert!(!pl.facing_right);
+    }
+
+    #[test]
+    fn artemis_variants_map_while_action_stays_logical() {
+        // Phase 8 (e.java `s()`): with the Blade of
+        // Artemis (weapon_mode 1) the anim plays a
+        // variant while `player.action` stays the
+        // logical action. Blades (mode 0) play as-is.
+        let a = super::Player::anim_action;
+        assert_eq!(a(27, 0), 27);
+        assert_eq!(a(3, 0), 3);
+        assert_eq!(a(97, 0), 97);
+        assert_eq!(a(27, 1), 29);
+        assert_eq!(a(3, 1), 4);
+        assert_eq!(a(97, 1), 98);
+        assert_eq!(a(5, 1), 6);
+        assert_eq!(a(8, 1), 9);
+        assert_eq!(a(100, 1), 101);
+        assert_eq!(a(38, 1), 39);
+        assert_eq!(a(0, 1), 0);
+        assert_eq!(a(60, 1), 60);
+        // The slot uses the variant: block enter
+        // with Artemis plays 29, action stays 27.
+        let (_parsed, _flags, anim) = level_9217();
+        let mut pl = super::Player::new(&anim, (48, 560), true, 0, 0);
+        pl.weapon_mode = 1;
+        assert!(pl.start_block(&anim));
+        assert_eq!(pl.action, 27);
+        assert_eq!(pl.slot.action, 29);
     }
 
     #[test]

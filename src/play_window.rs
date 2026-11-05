@@ -63,6 +63,7 @@ pub fn run(dir: &std::path::Path, factor: usize, save_dir: Option<&str>) -> i32 
         down: false,
         attack_queued: false,
         jump_queued: false,
+        key_queued: 0,
         next_frame: Instant::now(),
     };
     let _ = event_loop.run_app(&mut app);
@@ -80,6 +81,12 @@ struct App {
     down: bool,
     attack_queued: bool,
     jump_queued: bool,
+    /// Key code of the most recent discrete press
+    /// edge (Phase 8, the grapple mash): Left 2,
+    /// Right 5, Down 6; Up (1) and Attack (8) come
+    /// through the jump/attack queues. Consumed in
+    /// step() and passed to Game.key_code.
+    key_queued: i32,
     next_frame: Instant,
 }
 
@@ -95,6 +102,18 @@ impl App {
         };
         self.game.held_dir = dir;
         self.game.held_down = self.down;
+        // Press edges (Phase 8): the grapple mash
+        // reads the most recent discrete press.
+        // Attack (8) and Up (1) come through their
+        // queues; Left/Right/Down through key_queued.
+        if self.attack_queued {
+            self.game.key_code = 8;
+        } else if self.jump_queued {
+            self.game.key_code = 1;
+        } else if self.key_queued != 0 {
+            self.game.key_code = self.key_queued;
+            self.key_queued = 0;
+        }
         self.game.tick(40);
         if self.game.state == State::Playing {
             if self.attack_queued {
@@ -143,13 +162,19 @@ impl App {
         match code {
             KeyCode::ArrowLeft => {
                 self.left = pressed;
-                if pressed && self.game.state != State::Playing {
+                if pressed && self.game.state == State::Playing {
+                    // Press edge (Phase 8): the
+                    // grapple mash reads it.
+                    self.key_queued = 2;
+                } else if pressed {
                     self.game.update(Some(Input::Left));
                 }
             }
             KeyCode::ArrowRight => {
                 self.right = pressed;
-                if pressed && self.game.state != State::Playing {
+                if pressed && self.game.state == State::Playing {
+                    self.key_queued = 5;
+                } else if pressed {
                     self.game.update(Some(Input::Right));
                 }
             }
@@ -170,7 +195,11 @@ impl App {
                 // every frame; menus still get the
                 // press for scrolling.
                 self.down = pressed;
-                if pressed && self.game.state != State::Playing {
+                if pressed && self.game.state == State::Playing {
+                    // Press edge (Phase 8): the
+                    // grapple mash reads it.
+                    self.key_queued = 6;
+                } else if pressed {
                     self.game.update(Some(Input::Down));
                 }
             }

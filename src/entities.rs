@@ -374,6 +374,35 @@ pub fn camera_zones(parsed: &LevelEntities) -> Vec<crate::player::CameraZone> {
         .collect()
 }
 
+/// Type-7 camera zones (Phase 8): one
+/// `CameraZone7` per item, WITHOUT the half
+/// width — `ff` comes from the zone sprite's
+/// bbox in set 2048 action `fa`, which the
+/// caller (Gameplay::load) fills in. Positions
+/// are the `fd`/`fe` px points; extras are
+/// `[fa, fj, fk]` per item (`fa` = anim action,
+/// `fj` = enabled, `fk` = negative direction).
+/// Empty when the level has no type-7 group.
+pub fn camera_zones_7(parsed: &LevelEntities) -> Vec<(i32, i32, usize, bool, bool)> {
+    let Some(group) = parsed.group(7) else {
+        return Vec::new();
+    };
+    group
+        .positions
+        .iter()
+        .enumerate()
+        .map(|(i, &(x, y))| {
+            (
+                x,
+                y,
+                group.extra.get(i * 3).copied().unwrap_or(0) as usize,
+                group.extra.get(i * 3 + 1).copied().unwrap_or(0) != 0,
+                group.extra.get(i * 3 + 2).copied().unwrap_or(0) != 0,
+            )
+        })
+        .collect()
+}
+
 pub fn start_camera(level: &Level, spawn: (i32, i32)) -> (i32, i32) {
     let (ga, gb) = spawn;
     let look = if level.facing_right { 60 } else { -60 };

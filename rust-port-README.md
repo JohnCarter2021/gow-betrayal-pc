@@ -502,10 +502,14 @@ down, down, Select, Select, and draws the result to
   HUD weapon icon per mode (frame 5 + fM), fire-
   while-grabbing release (attack from 21 -> idle).
   `cargo test`: 136/136. Windows cross-build OK
-  (2,507,732 bytes). Not yet shipped — awaiting a
-  go-ahead to ship (v1.1.0 per the plan). Deviation:
-  walking out of block on a Left/Right press is NOT
-  ported (port uses held dir, not press edges).
+  (2,507,688 bytes as shipped; 2,507,732 in the
+  pre-ship build — the 44-byte difference is the
+  build directory path embedded in the binary).
+  Shipped as v1.1.0 (2026-11-05 ~20:52 IST, push
+  commit 0c6e4b4a, release id 435372778, marked
+  Latest). Deviation: walking out of block on a
+  Left/Right press is NOT ported (port uses held
+  dir, not press edges).
 - Phase 7 COMPLETE (2026-11-05): death, Arena
   completion & the full playthrough — death trigger
   (grounded → action 52, airborne → 26 then 52;
@@ -522,9 +526,12 @@ down, down, Select, Select, and draws the result to
   ticks; `he` bit + ho/hp/hs now sync to the save
   before every persist — previously never synced),
   enemy damage clamps health at 0. `cargo test`:
-  148/148. Windows cross-build OK (2,518,539
-  bytes). Not yet shipped — awaiting a go-ahead to
-  ship (v1.2.0 per the plan). Corrections: magic
+  148/148. Windows cross-build OK (2,518,501
+  bytes as shipped; 2,518,539 in the pre-ship
+  build — same path-embedding difference as
+  v1.1.0). Shipped as v1.2.0 (2026-11-05, push
+  commit 40fda5b3; release id 435387777, marked
+  Latest). Corrections: magic
   regeneration does NOT exist in the original (the
   Phase 3 note was a misreading — the only `hl +=`
   sites are state 104 and MAGIC-orb collection),
@@ -532,13 +539,31 @@ down, down, Select, Select, and draws the result to
   65 out of bounds = solid). Gaps: the single
   continuous 9217 walk is still unproven (probe
   reached the roof and stalled at the row-14
-  platform, tile 143); spawn-in anims (14/18/27)
-  are a Phase 8 gap.
+  platform, tile 143).
+
+## Phase 8 (2026-11-05, work only — NOT shipped; v1.3.0 ship needs the user's go-ahead)
+
+Grapple (the fR/fS/fQ button-mashing mini-game,
+4 tests), Artemis anim variants, collectible
+drawing (anim set 5120, sprite set 5123),
+stagger-13 variant (kind 13 in action 12 → 13,
+with a HEALTH orb — `n2` is the ENEMY's current
+action, correcting the Phase 6 note), spawn-in
+anims (27/14/18 by kind, with a timer), type-7
+camera zones (horizontal-only, `fj`/`fk`, half
+width from anim 2048 + sprite set 2051), flag-2
+enemy tiles (grounded walking enemies turn at
+flag-2 tiles). Sound slot 3 verified a no-op.
+Investigated and NOT ported: the `dS` enemy
+special attacks (needs the full AI decision
+tree), state-79 flame / cs=266/243 (tied to the
+dS machinery), walk/attack-from-block (needs
+press-edge input), and the untraced remainder
+(3GP video, other MIDI chunks, boot cases, RP
+chunk types, `hs` gold cap). 156/156 tests.
 
 ## Next steps (see ../REPORT.md)
-1. Ship Phase 6 (v1.1.0 per the plan) — awaiting go-ahead.
-2. Ship Phase 7 (v1.2.0 per the plan) — awaiting go-ahead.
-3. Phase 8: grapple, presentation & loose ends.
+1. Ship v1.3.0 — only on the user's go-ahead.
 
 The original jar is loaded from the user's own copy at runtime; no Glu
 assets are redistributed in this repo.

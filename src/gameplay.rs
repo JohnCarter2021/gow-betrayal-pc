@@ -46,6 +46,28 @@ pub fn palette_key(base: u32, level_index: usize) -> Option<u32> {
     }
 }
 
+/// Grapple state (Phase 8, e.java `fR`/`fS`/`fQ`/`fT`):
+/// Down on a weakened enemy starts the button-mashing
+/// mini-game. `enemy` is the grappled enemy's index
+/// (`ge`); `f_q` is the mashes needed (2 for kind-12,
+/// 3 for kind-13 enemies); `f_s` is the mashes done
+/// (-1 = a wrong button broke the grapple); `f_t` is
+/// the currently required button (0 Up, 1 Left,
+/// 2 Attack, 3 Right, 4 Down). The slot-131 bar
+/// (shared with the boss bar) shows the prompt for
+/// `f_t` via anim 1027 action `fU[f_t]`.
+pub struct GrappleState {
+    pub enemy: usize,
+    pub f_q: i32,
+    pub f_s: i32,
+    pub f_t: i32,
+}
+
+/// Prompt actions `fU` (e.java:593): fT -> anim 1027
+/// action, the icon the slot-131 bar shows for the
+/// required button.
+pub const GRAPPLE_PROMPT_ACTIONS: [usize; 5] = [2, 4, 5, 6, 8];
+
 pub struct Gameplay {
     pub parsed: LevelEntities,
     pub flags: TileFlags,
@@ -111,6 +133,13 @@ pub struct Gameplay {
     /// `b(137, L)`). None when either set fails to
     /// load (indicator disabled).
     stagger_bar: Option<BarState>,
+    /// Collectible sets (Phase 8): anim set 5120 +
+    /// sprite set 5123, slots 121+n (e.java:3296).
+    /// Drawn at each uncollected item's position
+    /// with action `ft` (0 gold, 1 health, 2 magic,
+    /// 3 upgrade). None when either set fails to
+    /// load (collectibles stay invisible).
+    pub collectible_sets: Option<(AnimSet, SpriteSet)>,
     /// Previous tick's player health `hk` (Phase 6):
     /// the hurt check compares it with the current
     /// health to find the damage taken this tick
@@ -130,6 +159,18 @@ pub struct Gameplay {
     /// Game from its held-down state before each
     /// tick; drives the block stance below.
     pub block_held: bool,
+    /// Grapple mini-game (Phase 8): `Some` while
+    /// the player is grappling an enemy (`fR`).
+    /// None otherwise.
+    pub grapple: Option<GrappleState>,
+    /// Key code of the most recent discrete press
+    /// (Phase 8, the grapple mash reads `s`): set
+    /// by Game from the Input before each tick
+    /// (Up 1, Left 2, Right 5, Down 6, Attack 8,
+    /// Select 27, Exit 29); Gameplay consumes it
+    /// (resets to 0) at the start of each tick.
+    /// Tests set it directly.
+    pub key_code: i32,
     /// Type-27 boxes (slice 22) and their anim /
     /// sprite sets (6144 / 6146).
     pub boxes: Vec<GameBox>,
@@ -280,6 +321,50 @@ impl Gameplay {
         player.max_health = 1024;
         // Type-3 camera zones (slice 23).
         player.set_camera_zones(entities::camera_zones(&parsed));
+        // Type-7 camera zones (Phase 8): the
+        // half width `ff` comes from the zone
+        // sprite's frame — anim set 2048 action
+        // `fa`, drawn from sprite set 2051
+        // (e.java:3211-3217, `eY = b(2051, ...)`
+        // at 3396). The frame width is halved:
+        // `ff` is the half width (the draw check
+        // at e.java:2501 uses `ff << 1`).
+        let zones_7: Vec<crate::player::CameraZone7> =
+            if let (Ok(anim_chunk), Ok(sprites)) =
+                (res.chunk(2048), res.sprite_set(2051, None))
+            {
+                if let Ok(anim_set) = anim::load_anim_set(&anim_chunk) {
+                    entities::camera_zones_7(&parsed)
+                        .into_iter()
+                        .map(|(x, y, action, enabled, negative)| {
+                            let half_w = anim::frames_for_timeline_frame(
+                                &anim_set, action, 0, 0,
+                            )
+                            .ok()
+                            .and_then(|frames| frames.first().copied())
+                            .and_then(|fr| {
+                                sprites
+                                    .frames
+                                    .get(fr.sprite_idx)
+                                    .map(|f| f.w / 2)
+                            })
+                            .unwrap_or(0);
+                            crate::player::CameraZone7 {
+                                x,
+                                y,
+                                half_w,
+                                enabled,
+                                negative,
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+        player.set_camera_zones_7(zones_7);
         let mut enemy_states = Vec::new();
         for e in enemies::enemies(&parsed) {
             if let Ok(anim_chunk) = res.chunk(e.anim_id) {
@@ -343,6 +428,25 @@ impl Gameplay {
                     slot,
                 })
             }
+            _ => None,
+        };
+        // Collectible sets (Phase 8): anim set 5120
+        // + sprite set 5123, slots 121+n (e.java:
+        // 3296 `a(121 + n, 5120, ft[n])` at level
+        // load). The sprite def is 5123, not 5120:
+        // anim 5120's actions reference sprite
+        // indices 0-32 and set 5123 has exactly 33
+        // frames (5124/5125 are other sets in RP5).
+        // Actions 0-3 are the gold/health/magic/
+        // upgrade icons (1 frame, repeat 63);
+        // action 4 is the 3-frame collected anim.
+        // None when either set fails to load
+        // (collectibles stay invisible, as before).
+        let collectible_sets = match (
+            res.chunk(5120).ok().and_then(|c| anim::load_anim_set(&c).ok()),
+            res.sprite_set(5123, None).ok(),
+        ) {
+            (Some(anim), Some(sprites)) => Some((anim, sprites)),
             _ => None,
         };
         // Upgrade-interstitial sets (Phase 7, state
@@ -508,10 +612,13 @@ impl Gameplay {
             bar,
             boss_bar,
             stagger_bar,
+            collectible_sets,
             prev_player_health: 1024,
             intro_index,
             intro_text,
             block_held: false,
+            grapple: None,
+            key_code: 0,
             boxes,
             box_anim,
             box_sprites,
@@ -895,6 +1002,231 @@ impl Gameplay {
 
     /// One 40 ms tick. `dir`: -1 left, 0 none, +1 right.
     /// `attack`: fire key pressed this frame.
+    /// Grapple target (Phase 8, e.java case 6): the
+    /// nearest weakened enemy in reach. The player
+    /// must be idle/walking (0/9) and grounded; the
+    /// enemy is alive, its feet are at the player's
+    /// feet (`gb == dU || gb+1 == dU`), it is within
+    /// reach (the `e.a(...)` rect overlap, here
+    /// |dx| < 48 and |dy| < 16), it is weakened
+    /// (`dX <= 0`) or (kind 13 and action 12), and
+    /// the tiles between the player and the enemy
+    /// in the player's row are clear of flag 1
+    /// (`bl5`).
+    fn grapple_target(&self) -> Option<usize> {
+        if !(self.player.action == 0 || self.player.action == 9) {
+            return None;
+        }
+        if !self.flags.landing_solid(
+            self.player.tile_x(),
+            self.player.walk_tile_y() + 1,
+            self.player.drop_platform_row,
+        ) {
+            return None;
+        }
+        let (px, py) = (self.player.ga, self.player.gb);
+        let (ptx, pty) = (self.player.tile_x(), self.player.walk_tile_y());
+        let mut best: Option<(i32, usize)> = None;
+        for (i, st) in self.enemy_states.iter().enumerate() {
+            if st.dead || st.dying {
+                continue;
+            }
+            if st.y != py && st.y != py + 1 {
+                continue;
+            }
+            if (st.x - px).abs() >= 48 || (st.y - py).abs() >= 16 {
+                continue;
+            }
+            let weakened = st.dx <= 0;
+            let kind13_action12 = st.enemy.kind == 13 && st.action == 12;
+            if !weakened && !kind13_action12 {
+                continue;
+            }
+            let etx = st.x / 16;
+            let (lo, hi) = if ptx <= etx { (ptx, etx) } else { (etx, ptx) };
+            let clear = (lo..=hi).all(|tx| self.flags.get(tx, pty) & 1 == 0);
+            if !clear {
+                continue;
+            }
+            let dist = (st.x - px).abs();
+            if best.map_or(true, |(d, _)| dist < d) {
+                best = Some((dist, i));
+            }
+        }
+        best.map(|(_, i)| i)
+    }
+
+    /// Random prompt `B()` (e.java:6642-6648): a
+    /// button 0-4, different from the current one
+    /// (re-rolls until it differs).
+    fn random_prompt(&mut self, current: i32) -> i32 {
+        loop {
+            let n = (self.rng.next() % 5) as i32;
+            if n != current {
+                return n;
+            }
+        }
+    }
+
+    /// Set the slot-131 bar (shared with the boss
+    /// bar) to a grapple prompt action.
+    fn set_grapple_bar(&mut self, prompt: i32) {
+        if let Some(bb) = &mut self.boss_bar {
+            let action = GRAPPLE_PROMPT_ACTIONS[prompt as usize];
+            bb.slot = crate::anim::AnimSlot::new(&bb.anim, action);
+        }
+    }
+
+    /// Start a grapple or finisher/throw (Phase 8,
+    /// e.java case 6), by kind class (`dQ`):
+    /// kind 11 + health < half -> finisher action
+    /// 12; kind 12 + enemy action 12/10 -> throw
+    /// action 117, else the grapple mini-game (fQ
+    /// 2, player action 88); kind 13 + enemy
+    /// action 12 -> throw action 113, else the
+    /// grapple (fQ 3, player action 91). The player
+    /// snaps to the enemy's x; the enemy faces the
+    /// player. `dM`/`dN` (main/cutscene enemy) are
+    /// not ported, so the throw/finisher branches
+    /// use only the action and health conditions.
+    fn start_grapple(&mut self, enemy: usize) {
+        let st = &self.enemy_states[enemy];
+        let kind = st.enemy.kind;
+        let (ehealth, emax, eaction) = (st.health, st.max_health, st.action);
+        let ex = st.x;
+        self.player.ga = ex;
+        self.player.facing_right = ex >= self.player.ga;
+        self.enemy_states[enemy].facing_right = self.player.facing_right;
+        match kind {
+            11 if ehealth > 0 && ehealth < emax >> 1 => {
+                self.player.set_action(&self.player_anim, 12);
+            }
+            12 if eaction == 12 || eaction == 10 => {
+                self.player.set_action(&self.player_anim, 117);
+            }
+            12 => {
+                let f_t = self.random_prompt(-1);
+                self.grapple = Some(GrappleState {
+                    enemy,
+                    f_q: 2,
+                    f_s: 0,
+                    f_t,
+                });
+                self.set_grapple_bar(f_t);
+                self.player.set_action(&self.player_anim, 88);
+            }
+            13 if eaction == 12 => {
+                self.player.set_action(&self.player_anim, 113);
+            }
+            13 => {
+                let f_t = self.random_prompt(-1);
+                self.grapple = Some(GrappleState {
+                    enemy,
+                    f_q: 3,
+                    f_s: 0,
+                    f_t,
+                });
+                self.set_grapple_bar(f_t);
+                self.player.set_action(&self.player_anim, 91);
+            }
+            _ => {}
+        }
+    }
+
+    /// Mash (Phase 8, e.java:5131-5163): while the
+    /// grapple is active, the pressed key (`s`) is
+    /// checked against the required button `f_t`
+    /// (0 Up, 1 Left, 2 Attack, 3 Right, 4 Down).
+    /// Correct -> `f_s += 1`, a new `f_t`, and the
+    /// bar shows the new prompt. Wrong (and not a
+    /// neutral key 0/27/29/4/9) -> `f_s = -1`
+    /// (the grapple is broken). The bar advances
+    /// (`t(131)`) each tick — but only here when
+    /// the boss bar is NOT latched, because the
+    /// latched boss-bar pulse (below) already
+    /// advances slot 131 each tick; advancing in
+    /// both places would double the rate.
+    fn tick_grapple_mash(&mut self) {
+        let Some(gr) = &mut self.grapple else {
+            return;
+        };
+        if !self.script.boss_latched() {
+            if let Some(bb) = &mut self.boss_bar {
+                bb.slot.advance(&bb.anim, 40);
+            }
+        }
+        if !(gr.f_s >= 0 && gr.f_s < gr.f_q) {
+            return;
+        }
+        let key = self.key_code;
+        let want = match gr.f_t {
+            0 => 1,
+            1 => 2,
+            2 => 8,
+            3 => 5,
+            _ => 6,
+        };
+        if key == want {
+            let cur = gr.f_t;
+            let next = self.random_prompt(cur);
+            let gr = self.grapple.as_mut().unwrap();
+            gr.f_t = next;
+            gr.f_s += 1;
+            self.set_grapple_bar(next);
+        } else if key != 0 && key != 27 && key != 29 && key != 4 && key != 9 {
+            self.grapple.as_mut().unwrap().f_s = -1;
+        }
+    }
+
+    /// Resolve (Phase 8, e.java:5238-5259): called
+    /// when the grapple action (88/91) ends.
+    /// `f_s >= f_q` -> success: the enemy dies (its
+    /// orbs spawn here, as the original's `b()`
+    /// call does) and the player plays 89 (kind 12)
+    /// or 92 (kind 13). Otherwise the grapple fails
+    /// and the player plays 90/93. Clears the
+    /// grapple and restores the boss-bar slot to the
+    /// latched action when latched. (The original
+    /// sets `ek = 1` and lets the finisher's hit
+    /// land the kill; the port kills outright here
+    /// because the finisher has no hit frame.)
+    fn resolve_grapple(&mut self) {
+        let Some(gr) = self.grapple.take() else {
+            return;
+        };
+        let kind = self.enemy_states[gr.enemy].enemy.kind;
+        let success = gr.f_s >= gr.f_q;
+        if success {
+            let (x, y, em) = {
+                let st = &mut self.enemy_states[gr.enemy];
+                if let Some(anim) = st.anim_set.clone() {
+                    st.apply_damage(&anim, i32::MAX / 2, false);
+                } else {
+                    st.health = 0;
+                    st.dying = true;
+                }
+                (st.x, st.y, st.enemy.em)
+            };
+            let drop_kind = if kind == 12 {
+                crate::pickups::MAGIC
+            } else {
+                crate::pickups::GOLD
+            };
+            self.pickups.spawn(x, y - 16, drop_kind, em, &mut self.rng);
+            let action = if kind == 13 { 92 } else { 89 };
+            self.player.set_action(&self.player_anim, action);
+        } else {
+            let action = if kind == 13 { 93 } else { 90 };
+            self.player.set_action(&self.player_anim, action);
+        }
+        if self.script.boss_latched() {
+            if let Some(bb) = &mut self.boss_bar {
+                let action = self.script.boss_action();
+                bb.slot = crate::anim::AnimSlot::new(&bb.anim, action as usize);
+            }
+        }
+    }
+
     pub fn tick(&mut self, res: &mut Resources, dir: i32, attack: bool) {
         // A showing intro dialog freezes the world
         // (the original's state 1 -> 107 path shows
@@ -928,6 +1260,12 @@ impl Gameplay {
             self.tick_upgrade();
             return;
         }
+        // Grapple mash (Phase 8): the pressed key
+        // (`key_code`, consumed here) is checked
+        // against the required button while the
+        // grapple is active.
+        self.tick_grapple_mash();
+        self.key_code = 0;
         // Climb turn (slice 21): Left/Right pressed
         // opposite to the facing while holding (33)
         // flips the player around the wall (44).
@@ -949,7 +1287,14 @@ impl Gameplay {
             // only on the press edge, while grounded.
             let down_edge = !self.prev_block_held;
             if down_edge && (self.player.action == 0 || self.player.action == 9) {
-                if let Some((lx, action)) = doors::check_lever(
+                // Grapple (Phase 8, e.java case 6):
+                // Down on a weakened enemy in reach
+                // starts the finisher/throw/grapple
+                // instead of blocking or pulling a
+                // lever. Takes priority over both.
+                if let Some(enemy) = self.grapple_target() {
+                    self.start_grapple(enemy);
+                } else if let Some((lx, action)) = doors::check_lever(
                     &mut self.levers,
                     &mut self.doors,
                     &mut self.flags,
@@ -1038,7 +1383,15 @@ impl Gameplay {
         // the player must face to look at the
         // attacker, e.java:6623).
         let mut last_attacker_facing: Option<bool> = None;
-        for st in &mut self.enemy_states {
+        // The grappled enemy (Phase 8) is held (`ge`):
+        // it does not act or deal damage while the
+        // mini-game runs, or it would interrupt the
+        // grapple action (88/91) with a hurt reaction.
+        let grappled = self.grapple.as_ref().map(|gr| gr.enemy);
+        for (i, st) in self.enemy_states.iter_mut().enumerate() {
+            if grappled == Some(i) {
+                continue;
+            }
             if let Ok(anim_chunk) = res.chunk(st.enemy.anim_id) {
                 if let Ok(anim_set) = anim::load_anim_set(&anim_chunk) {
                     let dmg = st.tick(&anim_set, &self.flags, px, py, &mut self.rng);
@@ -1053,8 +1406,10 @@ impl Gameplay {
                             // `hu = gf; s(97)`).
                             self.player.facing_right = !st.facing_right;
                             self.player.action = 97;
-                            self.player.slot =
-                                anim::AnimSlot::new(&self.player_anim, 97);
+                            self.player.slot = anim::AnimSlot::new(
+                                &self.player_anim,
+                                crate::player::Player::anim_action(97, self.player.weapon_mode),
+                            );
                         } else {
                             self.player.health -= dmg;
                             // The original clamps health at 0
@@ -1135,6 +1490,13 @@ impl Gameplay {
                     self.player.ga - st.x >= 0 && self.player.ga - st.x <= 32
                 };
                 if in_front && (st.y - self.player.gb).abs() < 16 {
+                    // The kind-13 stagger variant
+                    // (Phase 8, e.java:6463-6464) keys
+                    // on the action the enemy is
+                    // playing when hit, so capture it
+                    // before apply_damage overwrites it.
+                    let pre_action = st.action;
+                    let pre_kind = st.enemy.kind;
                     let killed = if let Ok(anim_chunk) = res.chunk(st.enemy.anim_id) {
                         if let Ok(anim_set) = anim::load_anim_set(&anim_chunk) {
                             st.apply_damage(&anim_set, swing_damage, heavy)
@@ -1144,6 +1506,16 @@ impl Gameplay {
                     } else {
                         false
                     };
+                    // Stagger-13 orb (e.java:6464): a
+                    // kind-13 enemy hit while playing
+                    // action 12 staggers with 13 and
+                    // drops a health orb (`b(..., 1,
+                    // em)`) at its centre height.
+                    if !killed && pre_kind == 13 && pre_action == 12 && st.action == 13 {
+                        let (ox, oy, em) = (st.x, st.y - st.ef / 2, st.enemy.em);
+                        self.pickups
+                            .spawn(ox, oy, crate::pickups::HEALTH, em, &mut self.rng);
+                    }
                     self.combo_hits += 1;
                     self.combo_timer_ms = 2000;
                     // Arena kill count `dI` (Phase 5,
@@ -1217,6 +1589,15 @@ impl Gameplay {
         }
         self.prev_dir = dir;
         self.player.tick(&self.player_anim, &self.flags, w, h, dir);
+        // Grapple resolved (Phase 8): the grapple
+        // action (88/91) has ended; success or fail
+        // is decided by the mashes done.
+        if self.grapple.is_some()
+            && matches!(self.player.action, 88 | 91)
+            && self.player.slot.repeat == 0
+        {
+            self.resolve_grapple();
+        }
         // Death finished (Phase 7): the action-52
         // animation has ended; the caller (Game)
         // shows the death screen (state 108).
@@ -1553,13 +1934,12 @@ impl Gameplay {
     /// than 10 damage orbs; the spawn point more
     /// than 32 px from the player in either axis)
     /// the enemy respawns at its spawn point at full
-    /// health, idle — if the tile above the spawn is
-    /// clear (neither flag 1 nor flag 2); otherwise
-    /// the timer resets to 1500 ms and retries. The
-    /// respawn also sets flag 2 above the spawn.
-    /// The port respawns straight to idle (action 0)
-    /// — the original's spawn-in animations
-    /// (14/18/27) are a documented gap (Phase 8).
+    /// health, playing its spawn-in action (27 kind
+    /// 11, 14 kind 12, 18 kind 13; Phase 8) — if
+    /// the tile above the spawn is clear (neither
+    /// flag 1 nor flag 2); otherwise the timer
+    /// resets to 1500 ms and retries. The respawn
+    /// also sets flag 2 above the spawn.
     fn check_enemy_respawn(&mut self) {
         let (ga, gb) = (self.player.ga, self.player.gb);
         let orbs = self.pickups.orbs.len();
@@ -1590,11 +1970,19 @@ impl Gameplay {
                 st.x = sx;
                 st.y = sy;
                 st.health = st.max_health;
-                st.action = 0;
+                // Spawn-in (Phase 8, e.java:6350-6367):
+                // the enemy returns playing its
+                // spawn-in action (27 kind 11, 14
+                // kind 12, 18 kind 13), not idle.
+                // The one-shot (27) runs to its end;
+                // the loops (14/18) run 12 ticks.
+                let action = st.spawn_in_action();
+                st.action = action;
+                st.spawn_in = if action == 27 { 40 } else { 12 };
                 st.dead = false;
                 st.dying = false;
                 if let Some(anim_set) = &st.anim_set {
-                    st.slot = anim::AnimSlot::new(anim_set, 0);
+                    st.slot = anim::AnimSlot::new(anim_set, action);
                 }
                 self.flags.set_flag(sx / 16, sy / 16 - 1, 2);
             } else {
@@ -1662,6 +2050,37 @@ impl Gameplay {
                 self.player.cam_y,
             );
         }
+        // Collectibles (Phase 8): slots 121+n, set
+        // 5120, action `ft` (0 gold, 1 health, 2
+        // magic, 3 upgrade), drawn at the item's
+        // px position. Collected items are skipped
+        // (the original sets `fp` and draws the
+        // +4 action only while the pickup anim
+        // plays — the port draws nothing once
+        // collected).
+        if let Some((anim, sprites)) = &self.collectible_sets {
+            for it in &self.collectibles {
+                if it.collected {
+                    continue;
+                }
+                let action = it.kind as usize;
+                if let Ok(frames) = anim::frames_for_timeline_frame(anim, action, 0, 0) {
+                    for fr in frames {
+                        if let Some(frame) = sprites.frame(fr.sprite_idx) {
+                            midp::draw_sprite_frame(
+                                &g,
+                                fb,
+                                &sprites.image,
+                                frame,
+                                it.x + fr.dx - self.player.cam_x,
+                                it.y + fr.dy - self.player.cam_y,
+                                fr.transform,
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let player_transform = if self.player.facing_right { 0 } else { 2 };
         if let Ok(frames) = anim::frames_for_timeline_frame(&self.player_anim, self.player.action, self.player.slot.visual, player_transform) {
             for fr in frames {
@@ -1705,11 +2124,13 @@ impl Gameplay {
         // when the `@` latch holds, the player's
         // facing `hu` equals `aS`, and the player is
         // inside the viewport (`e.a(ga, gb, iQ, iR,
-        // E, F)`). The `!fR` grapple guard is vacuous
-        // here (grapple is not ported). The bar is a
-        // HUD element: screen coordinates, not
-        // camera-translated.
-        if self.script.boss_latched()
+        // E, F)`). The `!fR` guard (Phase 8): while
+        // a grapple is active the boss bar is hidden
+        // and slot 131 shows the grapple prompt
+        // instead. The bar is a HUD element: screen
+        // coordinates, not camera-translated.
+        if self.grapple.is_none()
+            && self.script.boss_latched()
             && self.script.boss_facing_right() == self.player.facing_right
             && self.player.ga >= self.player.cam_x
             && self.player.ga < self.player.cam_x + 240
@@ -1734,6 +2155,42 @@ impl Gameplay {
                                 295 + fr.dy,
                                 fr.transform,
                             );
+                        }
+                    }
+                }
+            }
+        }
+        // Grapple prompt bar (Phase 8, e.java:2046):
+        // while the grapple is active and mashes
+        // remain (`fS >= 0 && fS < fQ`), slot 131
+        // shows the prompt for the required button
+        // above the grappled enemy's head
+        // (`dT[ge] - iQ, dU[ge] - ef - ef/4 - iR`).
+        if let Some(gr) = &self.grapple {
+            if gr.f_s >= 0 && gr.f_s < gr.f_q {
+                if let Some(st) = self.enemy_states.get(gr.enemy) {
+                    if let Some(bb) = &self.boss_bar {
+                        let bx = st.x - self.player.cam_x;
+                        let by = st.y - st.ef - (st.ef >> 2) - self.player.cam_y;
+                        if let Ok(frames) = anim::frames_for_timeline_frame(
+                            &bb.anim,
+                            bb.slot.action,
+                            bb.slot.visual,
+                            0,
+                        ) {
+                            for fr in frames {
+                                if let Some(frame) = bb.sprites.frame(fr.sprite_idx) {
+                                    midp::draw_sprite_frame(
+                                        &g,
+                                        fb,
+                                        &bb.sprites.image,
+                                        frame,
+                                        bx + fr.dx,
+                                        by + fr.dy,
+                                        fr.transform,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -1993,6 +2450,58 @@ mod tests {
         gp.player.facing_right = true;
         t(&mut gp, &mut res, 0, false);
         assert!(!gp.script.boss_latched());
+    }
+
+    /// Phase 8: collectibles are drawn (set 5120,
+    /// slots 121+n, action `ft`) at their position
+    /// while uncollected, and hidden once collected.
+    #[test]
+    fn collectibles_draw_at_their_position() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 19456, false).unwrap();
+        gp.dismiss_intro();
+        assert!(gp.collectible_sets.is_some(), "set 5120 loads");
+        // Health upgrade at tile (91,12) -> px
+        // (1456,192). Teleport there and snap the
+        // camera so the item is on screen.
+        let it = gp
+            .collectibles
+            .iter()
+            .find(|c| c.kind == 3 && c.value > 0)
+            .expect("19456 has a health upgrade");
+        let (ix, iy) = (it.x, it.y);
+        gp.player.ga = ix;
+        gp.player.gb = iy;
+        gp.player.cam_x = ix - 120;
+        gp.player.cam_y = iy - 160;
+        let font_set = res.sprite_set(1031, None).expect("font 1031");
+        let font = crate::font::Font::from_sprite_set(font_set);
+        let mut fb = crate::midp::Framebuffer::new(240, 320);
+        gp.draw(&mut fb, &mut res, &font);
+        // Same scene with the item collected: the
+        // icon disappears. Compare the whole frame:
+        // the icon's anim offset (dx 32, dy -24)
+        // puts it off-centre from the item.
+        let mut gp2 = super::Gameplay::load(&mut res, 19456, false).unwrap();
+        gp2.dismiss_intro();
+        for c in gp2.collectibles.iter_mut() {
+            if c.x == ix && c.y == iy {
+                c.collected = true;
+            }
+        }
+        gp2.player.ga = ix;
+        gp2.player.gb = iy;
+        gp2.player.cam_x = ix - 120;
+        gp2.player.cam_y = iy - 160;
+        let mut fb2 = crate::midp::Framebuffer::new(240, 320);
+        gp2.draw(&mut fb2, &mut res, &font);
+        let changed = fb
+            .pixels
+            .iter()
+            .zip(fb2.pixels.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(changed > 0, "uncollected item changes pixels in the frame");
     }
 
     #[test]
@@ -3346,7 +3855,27 @@ mod tests {
         assert!(!st.dead, "Arena enemy respawns when the timer runs out");
         assert_eq!(st.health, st.max_health, "respawned at full health");
         assert_eq!((st.x, st.y), (sx, sy), "respawned at its spawn point");
-        assert_eq!(st.action, 0, "respawned idle (spawn-in anims not ported)");
+        // Phase 8: the enemy returns playing its
+        // spawn-in action (27 kind 11, 14 kind 12,
+        // 18 kind 13), not idle.
+        let kind = st.enemy.kind;
+        let want = match kind {
+            12 => 14,
+            13 => 18,
+            _ => 27,
+        };
+        assert_eq!(st.action, want, "respawned with the spawn-in action");
+        assert!(st.spawn_in > 0, "spawn-in timer runs");
+        // The spawn-in plays out and the enemy goes
+        // idle (the 1-frame loops exit on the timer;
+        // the one-shot exits on its repeat end).
+        let mut guard = 0;
+        while gp.enemy_states[0].spawn_in > 0 && guard < 100 {
+            guard += 1;
+            t(&mut gp, &mut res, 0, false);
+        }
+        assert_eq!(gp.enemy_states[0].action, 0, "spawn-in ends in idle");
+        assert_eq!(gp.enemy_states[0].spawn_in, 0, "spawn-in timer clears");
     }
 
     /// Phase 7: a dead level enemy with an
@@ -3435,6 +3964,196 @@ mod tests {
             .find(|it| it.kind == 3 && it.value == 0)
             .expect("19456 has a magic upgrade");
         assert!(!magic.collected, "magic upgrade untouched by the health bit");
+    }
+
+    /// Phase 8: Down on a weakened kind-12 enemy in
+    /// reach starts the grapple (player action 88,
+    /// fQ 2, fS 0, the slot-131 bar set to a prompt).
+    #[test]
+    fn grapple_starts_on_weakened_kind12() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        // 19456 has kind-12 enemies; 9217 has none
+        // (8 kind 11, 1 kind 13).
+        let mut gp = super::Gameplay::load(&mut res, 19456, false).unwrap();
+        gp.dismiss_intro();
+        // Find a kind-12 enemy and stand next to it.
+        let idx = gp
+            .enemy_states
+            .iter()
+            .position(|st| st.enemy.kind == 12)
+            .expect("19456 has a kind-12 enemy");
+        let (ex, ey) = (gp.enemy_states[idx].x, gp.enemy_states[idx].y);
+        gp.enemy_states[idx].dx = 0;
+        gp.enemy_states[idx].action = 0;
+        gp.player.ga = ex - 20;
+        gp.player.gb = ey;
+        gp.player.action = 0;
+        gp.player.slot = crate::anim::AnimSlot::new(&gp.player_anim, 0);
+        // Down press (edge): block_held false -> true.
+        gp.block_held = true;
+        t(&mut gp, &mut res, 0, false);
+        assert!(gp.grapple.is_some(), "grapple starts on a weakened enemy");
+        let gr = gp.grapple.as_ref().unwrap();
+        assert_eq!(gr.enemy, idx);
+        assert_eq!(gr.f_q, 2, "kind 12 needs 2 mashes");
+        assert_eq!(gr.f_s, 0);
+        assert_eq!(gp.player.action, 88, "kind-12 grapple plays action 88");
+        assert!(gp.boss_bar.is_some(), "slot-131 bar loads");
+        assert_eq!(
+            gp.boss_bar.as_ref().unwrap().slot.action,
+            super::GRAPPLE_PROMPT_ACTIONS[gr.f_t as usize],
+            "bar shows the prompt for the required button"
+        );
+    }
+
+    /// Phase 8: pressing the required button mashes
+    /// (f_s += 1, new f_t, bar updates); a wrong
+    /// button breaks the grapple (f_s = -1).
+    #[test]
+    fn grapple_mash_correct_advances_wrong_breaks() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 19456, false).unwrap();
+        gp.dismiss_intro();
+        let idx = gp
+            .enemy_states
+            .iter()
+            .position(|st| st.enemy.kind == 12)
+            .expect("19456 has a kind-12 enemy");
+        let (ex, ey) = (gp.enemy_states[idx].x, gp.enemy_states[idx].y);
+        gp.enemy_states[idx].dx = 0;
+        gp.enemy_states[idx].action = 0;
+        gp.player.ga = ex - 20;
+        gp.player.gb = ey;
+        gp.block_held = true;
+        t(&mut gp, &mut res, 0, false);
+        assert!(gp.grapple.is_some());
+        // Correct button for the current f_t.
+        let f_t = gp.grapple.as_ref().unwrap().f_t;
+        let want = match f_t {
+            0 => 1,
+            1 => 2,
+            2 => 8,
+            3 => 5,
+            _ => 6,
+        };
+        gp.key_code = want;
+        t(&mut gp, &mut res, 0, false);
+        assert_eq!(gp.grapple.as_ref().unwrap().f_s, 1, "correct mash counts");
+        // A wrong button breaks the grapple.
+        let f_t = gp.grapple.as_ref().unwrap().f_t;
+        let wrong = match f_t {
+            0 => 2,
+            1 => 1,
+            2 => 1,
+            3 => 1,
+            _ => 1,
+        };
+        assert_ne!(wrong, match f_t { 0 => 1, 1 => 2, 2 => 8, 3 => 5, _ => 6 });
+        gp.key_code = wrong;
+        t(&mut gp, &mut res, 0, false);
+        assert_eq!(gp.grapple.as_ref().unwrap().f_s, -1, "wrong button breaks it");
+    }
+
+    /// Phase 8: mashing f_q times then letting the
+    /// grapple action end kills the enemy (orbs
+    /// spawn) and plays the success pose 89.
+    #[test]
+    fn grapple_success_kills_enemy() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 19456, false).unwrap();
+        gp.dismiss_intro();
+        let idx = gp
+            .enemy_states
+            .iter()
+            .position(|st| st.enemy.kind == 12)
+            .expect("19456 has a kind-12 enemy");
+        let (ex, ey) = (gp.enemy_states[idx].x, gp.enemy_states[idx].y);
+        gp.enemy_states[idx].dx = 0;
+        gp.enemy_states[idx].action = 0;
+        gp.player.ga = ex - 20;
+        gp.player.gb = ey;
+        gp.block_held = true;
+        t(&mut gp, &mut res, 0, false);
+        assert!(gp.grapple.is_some());
+        let f_q = gp.grapple.as_ref().unwrap().f_q;
+        let orbs_before = gp.pickups.orbs.len();
+        for _ in 0..f_q {
+            let f_t = gp.grapple.as_ref().unwrap().f_t;
+            let want = match f_t {
+                0 => 1,
+                1 => 2,
+                2 => 8,
+                3 => 5,
+                _ => 6,
+            };
+            gp.key_code = want;
+            t(&mut gp, &mut res, 0, false);
+        }
+        assert_eq!(gp.grapple.as_ref().unwrap().f_s, f_q, "all mashes done");
+        // Let the grapple action (88) run to its end.
+        gp.block_held = false;
+        let mut guard = 0;
+        while gp.grapple.is_some() && guard < 200 {
+            guard += 1;
+            t(&mut gp, &mut res, 0, false);
+        }
+        assert!(gp.grapple.is_none(), "grapple resolves when action 88 ends");
+        assert_eq!(gp.player.action, 89, "success plays action 89");
+        assert!(
+            gp.enemy_states[idx].dying || gp.enemy_states[idx].dead,
+            "enemy dies on a successful grapple"
+        );
+        assert!(
+            gp.pickups.orbs.len() > orbs_before,
+            "success spawns the enemy's orbs"
+        );
+    }
+
+    /// Phase 8: a broken grapple (wrong button) plays
+    /// the fail pose 90 and leaves the enemy alive.
+    #[test]
+    fn grapple_failure_plays_90_and_spares_enemy() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 19456, false).unwrap();
+        gp.dismiss_intro();
+        let idx = gp
+            .enemy_states
+            .iter()
+            .position(|st| st.enemy.kind == 12)
+            .expect("19456 has a kind-12 enemy");
+        let (ex, ey) = (gp.enemy_states[idx].x, gp.enemy_states[idx].y);
+        gp.enemy_states[idx].dx = 0;
+        gp.enemy_states[idx].action = 0;
+        gp.player.ga = ex - 20;
+        gp.player.gb = ey;
+        gp.block_held = true;
+        t(&mut gp, &mut res, 0, false);
+        assert!(gp.grapple.is_some());
+        // Break it with a wrong button.
+        let f_t = gp.grapple.as_ref().unwrap().f_t;
+        let want = match f_t {
+            0 => 1,
+            1 => 2,
+            2 => 8,
+            3 => 5,
+            _ => 6,
+        };
+        let wrong = if want == 1 { 2 } else { 1 };
+        gp.key_code = wrong;
+        t(&mut gp, &mut res, 0, false);
+        assert_eq!(gp.grapple.as_ref().unwrap().f_s, -1);
+        gp.block_held = false;
+        let mut guard = 0;
+        while gp.grapple.is_some() && guard < 200 {
+            guard += 1;
+            t(&mut gp, &mut res, 0, false);
+        }
+        assert!(gp.grapple.is_none(), "grapple resolves when action 88 ends");
+        assert_eq!(gp.player.action, 90, "failure plays action 90");
+        assert!(
+            !gp.enemy_states[idx].dying && !gp.enemy_states[idx].dead,
+            "enemy survives a failed grapple"
+        );
     }
 }
 

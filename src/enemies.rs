@@ -382,6 +382,82 @@ mod tests {
         );
         assert!(!st13.apply_damage(&anim, 2, true));
         assert_eq!(st13.action, 8, "kind 13 heavy stagger is 8");
+        // Phase 8: a kind-13 enemy playing action 12
+        // when hit staggers with 13 (e.java:6463),
+        // regardless of heavy.
+        let mut st13 = super::EnemyState::new(
+            list.iter().find(|e| e.x == 1408).unwrap().clone(),
+            &anim,
+        );
+        st13.action = 12;
+        st13.slot = crate::anim::AnimSlot::new(&anim, 12);
+        assert!(!st13.apply_damage(&anim, 2, false));
+        assert_eq!(st13.action, 13, "kind 13 in action 12 staggers with 13");
+        let mut st13 = super::EnemyState::new(
+            list.iter().find(|e| e.x == 1408).unwrap().clone(),
+            &anim,
+        );
+        st13.action = 12;
+        st13.slot = crate::anim::AnimSlot::new(&anim, 12);
+        assert!(!st13.apply_damage(&anim, 2, true));
+        assert_eq!(st13.action, 13, "kind 13 in action 12 staggers with 13 (heavy too)");
+    }
+
+    #[test]
+    fn flag_2_tile_turns_a_walking_enemy() {
+        // Phase 8: flag 2 is an enemy barrier
+        // (e.java:6948) — a grounded walking enemy
+        // will not step into a flag-2 tile; it
+        // turns instead. Set flag 2 on the tile
+        // ahead of a walking enemy and it should
+        // reverse; without the flag it walks on.
+        let data = std::fs::read("../extracted/RP9").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        let chunk = pack.chunk(1).unwrap();
+        let parsed = crate::entities::parse_level_entities(9217, &chunk).unwrap();
+        let list = super::enemies(&parsed);
+        let anim_data = std::fs::read("../extracted/RP18").unwrap();
+        let anim_pack = crate::rp::parse_pack(&anim_data).unwrap();
+        let anim = crate::anim::load_anim_set(&anim_pack.chunk(0).unwrap()).unwrap();
+        let mut flags = flags_9217(&parsed);
+        let mut rng = crate::pickups::OrbRng(1);
+        // The 448 enemy walks right on flat ground
+        // (foot tile y=34, x=28); put flag 2 on the
+        // tile ahead (x=29, y=34). The player is
+        // placed 100 px right so the enemy chases
+        // (near_chase, |dx| < 144).
+        let enemy = list.iter().find(|e| e.x == 448).unwrap().clone();
+        let mut st = super::EnemyState::new(enemy, &anim);
+        st.action = 1;
+        st.facing_right = true;
+        st.slot = crate::anim::AnimSlot::new(&anim, 1);
+        let x0 = st.x;
+        // No flag: walks right.
+        for _ in 0..10 {
+            st.tick(&anim, &flags, 548, 560, &mut rng);
+            if !st.facing_right {
+                break;
+            }
+        }
+        assert!(st.x > x0, "no barrier: enemy walks right");
+        // With flag 2 ahead: turns.
+        let mut st = super::EnemyState::new(
+            list.iter().find(|e| e.x == 448).unwrap().clone(),
+            &anim,
+        );
+        st.action = 1;
+        st.facing_right = true;
+        st.slot = crate::anim::AnimSlot::new(&anim, 1);
+        flags.set_flag(29, 34, 2);
+        let mut turned = false;
+        for _ in 0..10 {
+            st.tick(&anim, &flags, 548, 560, &mut rng);
+            if !st.facing_right {
+                turned = true;
+                break;
+            }
+        }
+        assert!(turned, "flag-2 tile turns the enemy");
     }
 
     #[test]
@@ -518,6 +594,16 @@ pub struct EnemyState {
     /// reaches 0 (and the other respawn conditions
     /// hold) the enemy respawns at its spawn point.
     pub er: i32,
+    /// Spawn-in ticks remaining (Phase 8): after an
+    /// Arena/level respawn the enemy plays its
+    /// spawn-in action (27 kind 11, 14 kind 12, 18
+    /// kind 13; e.java:6350-6367) for this many
+    /// ticks before going idle. 0 when not
+    /// spawning in. The 1-frame loops (14/18) need
+    /// the timer to exit; the one-shot (27) exits
+    /// on its own repeat end or the timer,
+    /// whichever comes first.
+    pub spawn_in: i32,
     /// The enemy's anim set (cloned at load, Phase 4):
     /// lets the cutscene set the enemy's action to
     /// an aZ-table entry without a Resources lookup.
@@ -547,8 +633,22 @@ impl EnemyState {
             dx: 0,
             ed: enemy.ec,
             er: enemy.et,
+            spawn_in: 0,
             anim_set: None,
             enemy,
+        }
+    }
+
+    /// Spawn-in action by kind class (Phase 8,
+    /// e.java:6350-6367): kind 11 -> 27 (the
+    /// 14-frame one-shot; the `eh` branch's 26 is
+    /// a 1-frame loop, not ported — the port has
+    /// no `eh` flag), kind 12 -> 14, kind 13 -> 18.
+    pub fn spawn_in_action(&self) -> usize {
+        match self.enemy.kind {
+            12 => 14,
+            13 => 18,
+            _ => 27,
         }
     }
 
@@ -584,7 +684,17 @@ impl EnemyState {
     /// ~200 ms. Stagger root motion (set 18432):
     /// action 2 totals dx -26, action 7 -15,
     /// action 8 -32, action 9 -18 (backward).
-    pub fn stagger_action(&self, heavy: bool) -> usize {
+    /// Stagger action for a non-lethal hit (Phase 6,
+    /// e.java:6446-6490, with the Phase 8 kind-13
+    /// variant): kind 11 -> 7 (heavy) / 2, kind 12
+    /// -> 9 / 2, kind 13 -> 13 when the enemy is
+    /// currently playing action 12 (`n2 == 12`,
+    /// e.java:6463; `dM != n9` is not ported — the
+    /// port has no main-enemy marker, so any kind-13
+    /// enemy in action 12 takes the 13), else 8
+    /// (heavy) / 4. `current_action` is the enemy's
+    /// action before this hit.
+    pub fn stagger_action(&self, heavy: bool, current_action: usize) -> usize {
         match self.enemy.kind {
             11 => {
                 if heavy {
@@ -601,7 +711,9 @@ impl EnemyState {
                 }
             }
             13 => {
-                if heavy {
+                if current_action == 12 {
+                    13
+                } else if heavy {
                     8
                 } else {
                     4
@@ -628,6 +740,11 @@ impl EnemyState {
         if self.dead || self.dying {
             return false;
         }
+        // The kind-13 stagger variant (Phase 8) keys
+        // on the action the enemy is playing when
+        // hit, so capture it before the stagger
+        // overwrites it.
+        let current_action = self.action;
         self.health -= amount;
         if self.health <= 0 {
             self.dying = true;
@@ -635,7 +752,7 @@ impl EnemyState {
             self.slot = anim::AnimSlot::new(anim_set, self.action);
             return true;
         }
-        self.action = self.stagger_action(heavy);
+        self.action = self.stagger_action(heavy, current_action);
         self.slot = anim::AnimSlot::new(anim_set, self.action);
         false
     }
@@ -678,6 +795,22 @@ impl EnemyState {
             if self.slot.repeat == 0 {
                 self.dying = false;
                 self.dead = true;
+            }
+            return 0;
+        }
+        // Spawn-in (Phase 8): after a respawn the
+        // enemy plays its spawn-in action before
+        // going idle. The one-shot (27) ends on
+        // its own repeat; the 1-frame loops (14/18)
+        // exit on the timer (12 ticks ~ 500 ms).
+        // No AI, no damage, no hits while it plays.
+        if self.spawn_in > 0 {
+            self.slot.advance(anim_set, 40);
+            self.spawn_in -= 1;
+            if self.spawn_in <= 0 || self.slot.repeat == 0 {
+                self.spawn_in = 0;
+                self.action = 0;
+                self.slot = anim::AnimSlot::new(anim_set, 0);
             }
             return 0;
         }
@@ -790,9 +923,20 @@ impl EnemyState {
         let gw = self.x / 16;
         let gy = (self.y - 1) / 16;
         let ahead = if self.facing_right { gw + 1 } else { gw - 1 };
+        // Flag 2 is an enemy barrier (Phase 8,
+        // e.java:6948): a grounded walking enemy
+        // (action 1) will not step into a tile
+        // with flag 2 set — it turns instead. The
+        // original exempts the enemy's own spawn
+        // column (`dZ`) and the `eh` state; the
+        // port has neither, so the barrier is
+        // absolute while walking. Flag 2 is set by
+        // type-7 zone footprints and by respawns
+        // (above the spawn point).
         let blocked = flags.solid(ahead, gy)
             || flags.solid(ahead, gy - 1)
-            || flags.solid(ahead, gy - 2);
+            || flags.solid(ahead, gy - 2)
+            || flags.get(ahead, gy) & 2 != 0;
         if blocked {
             self.facing_right = !self.facing_right;
         }
