@@ -300,13 +300,22 @@ impl Graphics {
             4 | 5 | 6 | 7 => (src_h, src_w),
             _ => (src_w, src_h),
         };
+        // Source coordinate along each axis, exact and division-free:
+        // lx(ox) = ox*gw/dw and ly(oy) = oy*gh/dh, advanced with a
+        // Bresenham error term instead of a division per pixel. The
+        // old code did two integer divisions per destination pixel;
+        // at HD that is ~1M divisions per frame (the sprite half of
+        // the HD lag). The mapping is identical, so the output is
+        // pixel-for-pixel the same.
+        let mut ly = 0i32;
+        let mut err_y = 0i32;
         for oy in 0..dh {
+            let mut lx = 0i32;
+            let mut err_x = 0i32;
             for ox in 0..dw {
                 // Destination pixel -> logical position on the
                 // transform's grid, then the inverse transform
                 // gives the source pixel.
-                let lx = ox * gw / dw;
-                let ly = oy * gh / dh;
                 let (col, row) = match transform {
                     0 => (lx, ly),
                     1 => (lx, src_h - 1 - ly),
@@ -320,11 +329,24 @@ impl Graphics {
                 };
                 let sx = src_x + col;
                 let sy = src_y + row;
-                if sx < 0 || sy < 0 || sx as usize >= img.width || sy as usize >= img.height {
-                    continue;
+                if sx >= 0
+                    && sy >= 0
+                    && (sx as usize) < img.width
+                    && (sy as usize) < img.height
+                {
+                    let p = img.pixel(sx as usize, sy as usize);
+                    self.put(fb, dx + ox, dy + oy, p);
                 }
-                let p = img.pixel(sx as usize, sy as usize);
-                self.put(fb, dx + ox, dy + oy, p);
+                err_x += gw;
+                while err_x >= dw {
+                    lx += 1;
+                    err_x -= dw;
+                }
+            }
+            err_y += gh;
+            while err_y >= dh {
+                ly += 1;
+                err_y -= dh;
             }
         }
     }

@@ -17,9 +17,11 @@
 use crate::midp::{draw_sprite_frame, Framebuffer, Graphics};
 use crate::resources::SpriteSet;
 use crate::sprite::Frame;
+use std::rc::Rc;
 
 pub struct Font {
-    pub image: crate::midp::Image,
+    /// Shared decoded font sheet (see `Resources::images`).
+    pub image: Rc<crate::midp::Image>,
     pub glyphs: Vec<Frame>,
 }
 

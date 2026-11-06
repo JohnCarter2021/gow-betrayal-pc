@@ -13,6 +13,7 @@ use crate::sprite::{parse_sprite_def, Frame, SpriteDef};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// HD art scale: AI-upscaled sheets are 4x the jar's sheets.
 pub const HD_SCALE: usize = 4;
@@ -23,6 +24,13 @@ pub struct Resources {
     /// True once HD art is enabled (see `enable_hd`): sprite images
     /// are then loaded from `<dir>/hd/` when a matching file exists.
     pub hd_enabled: bool,
+    /// Decoded images, shared by every draw call. PNG decoding (the
+    /// std-only DEFLATE inflater) takes 100-900 ms per HD sheet, and
+    /// the game loads the same sheets every frame (player, enemies,
+    /// tileset, HUD, font, ...), so without this cache HD ran at ~1
+    /// FPS. Images are immutable once decoded, so sharing them with
+    /// Rc is safe.
+    images: HashMap<(u32, Option<u32>), Rc<Image>>,
 }
 
 impl Resources {
@@ -31,6 +39,7 @@ impl Resources {
             dir: dir.as_ref().to_path_buf(),
             packs: HashMap::new(),
             hd_enabled: false,
+            images: HashMap::new(),
         }
     }
 
@@ -117,7 +126,20 @@ impl Resources {
     /// With HD enabled, an upscaled sheet in `hd/` is used instead
     /// when one exists for this (image, key) and is exactly 4x the
     /// jar image; otherwise the jar image is used (scale 1).
-    pub fn image(&mut self, id: u32, palette_key_id: Option<u32>) -> Result<Image, RpError> {
+    /// The decoded image is cached and shared (see `images`): the
+    /// same sheets are requested every frame, and re-decoding an HD
+    /// sheet costs 100-900 ms.
+    pub fn image(&mut self, id: u32, palette_key_id: Option<u32>) -> Result<Rc<Image>, RpError> {
+        let key = (id, palette_key_id);
+        if let Some(img) = self.images.get(&key) {
+            return Ok(Rc::clone(img));
+        }
+        let img = Rc::new(self.load_image(id, palette_key_id)?);
+        self.images.insert(key, Rc::clone(&img));
+        Ok(img)
+    }
+
+    fn load_image(&mut self, id: u32, palette_key_id: Option<u32>) -> Result<Image, RpError> {
         if self.hd_enabled {
             let path = self.hd_path(id, palette_key_id);
             if let Ok(bytes) = fs::read(&path) {
@@ -174,7 +196,10 @@ impl Resources {
 
 #[derive(Debug, Clone)]
 pub struct SpriteSet {
-    pub image: Image,
+    /// Shared decoded image (see `Resources::images`): cloning the
+    /// Rc is cheap, so a sprite set can be rebuilt every frame
+    /// without re-decoding its sheet.
+    pub image: Rc<Image>,
     pub frames: Vec<Frame>,
 }
 

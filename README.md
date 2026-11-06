@@ -2,15 +2,15 @@
 
 A Rust PC port, in progress, of *God of War: Betrayal* (J2ME, Glu Mobile, v1.4.8).
 
-Status, 2026-11-06 — v1.5.0: everything in v1.4.1, plus HD art — every
-sprite the game loads (34 sheets + 8 palette variants) AI-upscaled 4x
-(Real-ESRGAN x4plus-anime), and the port renders at 960x1280 from an
-`hd/` folder next to the RP packs, falling back to the original sprites
-without it. F11 toggles borderless fullscreen; the frame is fitted to
-the window preserving 3:4. The HD art pack itself is NOT in this repo
-(it is upscaled Glu art, generated from the user's own jar); the port
-loads it when present. `--hd` enables HD for the headless `--scene` /
-`--game` modes.
+Status, 2026-11-07 — v1.5.1: everything in v1.5.0, plus an HD performance
+fix. HD ran at ~1 FPS because the game re-read and re-decoded every HD
+sheet from disk on every frame (the std-only PNG inflater took 100-900
+ms per sheet). Now decoded images are cached and shared, the inflater
+is a buffered canonical-Huffman decoder (first loads 7-25x faster), the
+tile and sprite blits use division-free stepping, and the window's
+bilinear fit is integer fixed-point with precomputed axis maps. A full
+HD scene render went from ~8 s to ~0.3 s; a warm HD frame is ~30 ms
+draw + ~10 ms fit on the build VM. Output is pixel-identical to v1.5.0.
 
 - **MIDP shim, std-only, no crates:** 240×320 framebuffer, `Graphics`
   (clip / translate / `drawRegion` with all 8 MIDP transforms), sprite

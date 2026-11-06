@@ -217,20 +217,46 @@ pub fn draw_view(level: &Level, tileset: &Image, fb: &mut Framebuffer, cam_x: i3
             let sy = (tile / cols) * sw;
             let dx = (tx as i32 * tile_w - cam_x) * fb.scale as i32;
             let dy = (ty as i32 * tile_w - cam_y) * fb.scale as i32;
+            // Source coordinates are exact and division-free: the
+            // source row is fixed per destination row, and the
+            // source column advances with a Bresenham error term
+            // (src = dst*sw/dw). The old code divided twice per
+            // pixel; at HD that is ~2.4M divisions per frame.
+            let mut src_y = sy;
+            let mut err_y = 0i32;
             for py in 0..dw {
+                let mut src_x = sx;
+                let mut err_x = 0i32;
+                let fy = dy + py;
+                let fb_row = if fy >= 0 && (fy as usize) < fb.height {
+                    (fy as usize) * fb.width
+                } else {
+                    // Whole row is off-screen; still advance src_y.
+                    err_y += sw;
+                    while err_y >= dw {
+                        src_y += 1;
+                        err_y -= dw;
+                    }
+                    continue;
+                };
                 for px in 0..dw {
-                    let sp = tileset.pixel(
-                        (sx + px * sw / dw) as usize,
-                        (sy + py * sw / dw) as usize,
-                    );
-                    if (sp >> 24) & 0xFF == 0 {
-                        continue;
+                    let sp = tileset.pixel(src_x as usize, src_y as usize);
+                    if (sp >> 24) & 0xFF != 0 {
+                        let fx = dx + px;
+                        if fx >= 0 && (fx as usize) < fb.width {
+                            fb.pixels[fb_row + (fx as usize)] = sp;
+                        }
                     }
-                    let fx = dx + px;
-                    let fy = dy + py;
-                    if fx >= 0 && (fx as usize) < fb.width && fy >= 0 && (fy as usize) < fb.height {
-                        fb.pixels[(fy as usize) * fb.width + (fx as usize)] = sp;
+                    err_x += sw;
+                    while err_x >= dw {
+                        src_x += 1;
+                        err_x -= dw;
                     }
+                }
+                err_y += sw;
+                while err_y >= dw {
+                    src_y += 1;
+                    err_y -= dw;
                 }
             }
         }

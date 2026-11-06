@@ -28,47 +28,72 @@ fn be32(b: &[u8]) -> u32 {
 
 struct BitReader<'a> {
     data: &'a [u8],
-    pos: usize, // bit position
+    pos: usize, // next byte to pull into the buffer
+    /// Buffered bits, LSB-first; `bit_cnt` of them are valid.
+    bit_buf: u64,
+    bit_cnt: u32,
 }
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        BitReader { data, pos: 0 }
-    }
-    fn bits(&mut self, n: usize) -> Result<u32, PngError> {
-        let mut v = 0u32;
-        for i in 0..n {
-            let byte = self.pos / 8;
-            if byte >= self.data.len() {
-                return Err(PngError("deflate: unexpected end".into()));
-            }
-            let bit = (self.data[byte] >> (self.pos % 8)) & 1;
-            v |= (bit as u32) << i;
-            self.pos += 1;
+        BitReader {
+            data,
+            pos: 0,
+            bit_buf: 0,
+            bit_cnt: 0,
         }
+    }
+    /// Read `n` bits (n <= 16 here: Huffman codes are at most 15
+    /// bits, extra-bit fields at most 13). Bytes are pulled into a
+    /// 64-bit buffer, so this is a few integer ops instead of a
+    /// per-bit loop with a division and a bounds check per bit.
+    fn bits(&mut self, n: usize) -> Result<u32, PngError> {
+        if n == 0 {
+            return Ok(0);
+        }
+        while self.bit_cnt < n as u32 {
+            let byte = *self
+                .data
+                .get(self.pos)
+                .ok_or_else(|| PngError("deflate: unexpected end".into()))?;
+            self.pos += 1;
+            self.bit_buf |= (byte as u64) << self.bit_cnt;
+            self.bit_cnt += 8;
+        }
+        let v = (self.bit_buf & ((1u64 << n) - 1)) as u32;
+        self.bit_buf >>= n;
+        self.bit_cnt -= n as u32;
         Ok(v)
     }
     fn align_byte(&mut self) {
-        self.pos = (self.pos + 7) / 8 * 8;
+        // Discard buffered bits up to the next byte boundary.
+        let drop = self.bit_cnt % 8;
+        self.bit_buf >>= drop;
+        self.bit_cnt -= drop;
     }
 }
 
 struct Huffman {
-    // (code, length, symbol), sorted by (length, code) for canonical decode.
-    codes: Vec<(u32, u8, u16)>,
+    /// counts[len] = number of codes of that length.
+    counts: [u16; 16],
+    /// Symbols in canonical order: sorted by (length, code), so the
+    /// symbols of length `len` occupy a contiguous run. Decoding
+    /// walks lengths accumulating the canonical first code, which
+    /// finds the symbol in O(max_len) with no per-symbol scan.
+    symbols: Vec<u16>,
     max_len: u8,
 }
 impl Huffman {
     fn from_lengths(lengths: &[u8]) -> Huffman {
-        let mut bl_count = [0u32; 16];
+        let mut counts = [0u16; 16];
         for &l in lengths {
             if l > 0 {
-                bl_count[l as usize] += 1;
+                counts[l as usize] += 1;
             }
         }
         let mut next_code = [0u32; 16];
         let mut code = 0u32;
         for bits in 1..16 {
-            code = (code + bl_count[bits - 1]) << 1;
+            code = (code + counts[bits - 1] as u32) << 1;
             next_code[bits] = code;
         }
         let mut codes = Vec::new();
@@ -82,19 +107,30 @@ impl Huffman {
             }
         }
         codes.sort_by_key(|&(c, l, _)| (l, c));
-        Huffman { codes, max_len }
+        let symbols: Vec<u16> = codes.iter().map(|&(_, _, s)| s).collect();
+        Huffman {
+            counts,
+            symbols,
+            max_len,
+        }
     }
+    /// Canonical Huffman decode (puff.c's algorithm): walk the code
+    /// lengths, keeping the running code and the first code of each
+    /// length; the symbol is an index into the sorted symbol table.
     fn decode(&self, r: &mut BitReader) -> Result<u16, PngError> {
-        let mut code = 0u32;
-        for len in 1..=self.max_len {
-            let bit = r.bits(1)?;
-            code = (code << 1) | bit;
-            // Linear scan is fine for these small PNGs (max ~17 KB IDAT).
-            for &(c, l, sym) in &self.codes {
-                if l == len && c == code {
-                    return Ok(sym);
-                }
+        let mut code: i32 = 0;
+        let mut first: i32 = 0;
+        let mut index: i32 = 0;
+        for len in 1..=self.max_len as usize {
+            code |= r.bits(1)? as i32;
+            let count = self.counts[len] as i32;
+            if code - count < first {
+                return Ok(self.symbols[(index + (code - first)) as usize]);
             }
+            index += count;
+            first += count;
+            first <<= 1;
+            code <<= 1;
         }
         Err(PngError("deflate: invalid huffman code".into()))
     }
@@ -166,7 +202,10 @@ pub fn inflate(data: &[u8]) -> Result<Vec<u8>, PngError> {
         match btype {
             0 => {
                 r.align_byte();
-                let byte_pos = r.pos / 8;
+                // After alignment the buffer holds whole bytes; the
+                // next unread stream byte is pos minus the buffered
+                // whole bytes.
+                let byte_pos = r.pos - (r.bit_cnt / 8) as usize;
                 if byte_pos + 4 > r.data.len() {
                     return Err(PngError("deflate: stored block truncated".into()));
                 }
@@ -175,7 +214,10 @@ pub fn inflate(data: &[u8]) -> Result<Vec<u8>, PngError> {
                     return Err(PngError("deflate: stored block overruns".into()));
                 }
                 out.extend_from_slice(&r.data[byte_pos + 4..byte_pos + 4 + len]);
-                r.pos = (byte_pos + 4 + len) * 8;
+                // Consume the stored bytes and drop the bit buffer.
+                r.pos = byte_pos + 4 + len;
+                r.bit_buf = 0;
+                r.bit_cnt = 0;
             }
             1 => {
                 let mut lit_lengths = [0u8; 288];
