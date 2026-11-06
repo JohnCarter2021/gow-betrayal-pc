@@ -39,6 +39,10 @@ pub struct Image {
     pub height: usize,
     /// ARGB pixels, row-major.
     pub pixels: Vec<u32>,
+    /// Source scale relative to the game's logical pixels: 1 for the
+    /// jar's own sheets, 4 for an AI-upscaled HD sheet (see
+    /// resources.rs). Drawing code scales source rects by this.
+    pub scale: usize,
 }
 
 impl Image {
@@ -48,6 +52,7 @@ impl Image {
             width: d.width,
             height: d.height,
             pixels: d.pixels,
+            scale: 1,
         })
     }
     pub fn from_argb(width: usize, height: usize, pixels: Vec<u32>) -> Result<Image, String> {
@@ -63,6 +68,7 @@ impl Image {
             width,
             height,
             pixels,
+            scale: 1,
         })
     }
     pub fn pixel(&self, x: usize, y: usize) -> u32 {
@@ -75,6 +81,10 @@ pub struct Framebuffer {
     pub width: usize,
     pub height: usize,
     pub pixels: Vec<u32>,
+    /// Render scale relative to the game's logical 240x320: 1 for the
+    /// original resolution, 4 when rendering with HD art. Drawing
+    /// primitives scale game coordinates by this.
+    pub scale: usize,
 }
 
 impl Framebuffer {
@@ -83,10 +93,18 @@ impl Framebuffer {
             width,
             height,
             pixels: vec![0; width * height],
+            scale: 1,
         }
     }
     pub fn game() -> Framebuffer {
         Framebuffer::new(GAME_WIDTH, GAME_HEIGHT)
+    }
+    /// Game framebuffer at `scale` times the logical resolution
+    /// (scale 4 = 960x1280, for HD rendering).
+    pub fn game_scaled(scale: usize) -> Framebuffer {
+        let mut fb = Framebuffer::new(GAME_WIDTH * scale, GAME_HEIGHT * scale);
+        fb.scale = scale;
+        fb
     }
     pub fn clear(&mut self, argb: u32) {
         self.pixels.fill(argb);
@@ -117,11 +135,16 @@ pub struct Graphics {
 
 impl Default for Graphics {
     fn default() -> Self {
+        // Default clip is effectively unbounded (the framebuffer
+        // bounds in `put` still apply); callers that need a clip
+        // set it explicitly to the framebuffer size. This matters
+        // for HD rendering, where the framebuffer is 960x1280 and a
+        // 240x320 default clip would cut the picture to a quarter.
         Graphics {
             clip_x: 0,
             clip_y: 0,
-            clip_w: GAME_WIDTH as i32,
-            clip_h: GAME_HEIGHT as i32,
+            clip_w: i32::MAX / 2,
+            clip_h: i32::MAX / 2,
             translate_x: 0,
             translate_y: 0,
             color: 0xFF00_0000,
@@ -168,10 +191,12 @@ impl Graphics {
         if w <= 0 || h <= 0 {
             return;
         }
-        let x0 = x + self.translate_x;
-        let y0 = y + self.translate_y;
-        for yy in y0..y0 + h {
-            for xx in x0..x0 + w {
+        // Game coordinates scale to framebuffer pixels by fb.scale.
+        let s = fb.scale as i32;
+        let x0 = (x + self.translate_x) * s;
+        let y0 = (y + self.translate_y) * s;
+        for yy in y0..y0 + h * s {
+            for xx in x0..x0 + w * s {
                 self.put(fb, xx, yy, self.color);
             }
         }
@@ -180,6 +205,8 @@ impl Graphics {
     /// MIDP drawRGB: `rgb` holds ARGB ints; `process_alpha` false means
     /// alpha is ignored (drawn opaque), true means transparent pixels are
     /// skipped (no blending — the game does not rely on blending here).
+    /// The source is logical (game) pixels; it is nearest-sampled up to
+    /// the framebuffer scale.
     pub fn draw_rgb(
         &self,
         fb: &mut Framebuffer,
@@ -195,11 +222,13 @@ impl Graphics {
         if w <= 0 || h <= 0 {
             return;
         }
-        let x0 = x + self.translate_x;
-        let y0 = y + self.translate_y;
-        for row in 0..h {
-            for col in 0..w {
-                let idx = offset + row as usize * scanlength + col as usize;
+        let s = fb.scale as i32;
+        let x0 = (x + self.translate_x) * s;
+        let y0 = (y + self.translate_y) * s;
+        for row in 0..h * s {
+            for col in 0..w * s {
+                let idx = offset + (row as usize / s as usize) * scanlength
+                    + (col as usize / s as usize);
                 if let Some(&p) = rgb.get(idx) {
                     let p = if process_alpha {
                         p
@@ -214,6 +243,14 @@ impl Graphics {
 
     /// MIDP drawRegion with anchor. Anchor bits: HCENTER=1, VCENTER=2,
     /// LEFT=4, RIGHT=8, TOP=16, BOTTOM=32. The game passes 20 (TOP|LEFT).
+    ///
+    /// `src_*` are image pixels; `dest_*` are game (logical) coordinates.
+    /// The destination size is the source size times fb.scale / img.scale,
+    /// so an HD image (scale 4) into an HD framebuffer (scale 4) blits 1:1,
+    /// a jar image (scale 1) into an HD framebuffer is nearest-upscaled 4x,
+    /// and an HD image into an SD framebuffer is nearest-downsampled.
+    /// Sampling is destination-driven (nearest neighbour), so every case
+    /// is exact, including the 8 transforms (the game only uses 0-3).
     pub fn draw_region(
         &self,
         fb: &mut Framebuffer,
@@ -230,13 +267,23 @@ impl Graphics {
         if src_w <= 0 || src_h <= 0 {
             return;
         }
+        let img_scale = img.scale.max(1) as i32;
         // Destination size after rotation: 90/270-degree transforms swap w/h.
         let (dw, dh) = match transform {
-            4 | 5 | 6 | 7 => (src_h, src_w),
-            _ => (src_w, src_h),
+            4 | 5 | 6 | 7 => (
+                src_h * fb.scale as i32 / img_scale,
+                src_w * fb.scale as i32 / img_scale,
+            ),
+            _ => (
+                src_w * fb.scale as i32 / img_scale,
+                src_h * fb.scale as i32 / img_scale,
+            ),
         };
-        let mut dx = dest_x + self.translate_x;
-        let mut dy = dest_y + self.translate_y;
+        if dw <= 0 || dh <= 0 {
+            return;
+        }
+        let mut dx = (dest_x + self.translate_x) * fb.scale as i32;
+        let mut dy = (dest_y + self.translate_y) * fb.scale as i32;
         if anchor & 8 != 0 {
             dx -= dw;
         } else if anchor & 1 != 0 {
@@ -247,29 +294,36 @@ impl Graphics {
         } else if anchor & 2 != 0 {
             dy -= dh / 2;
         }
-        for row in 0..src_h {
-            for col in 0..src_w {
+        // Logical grid size along each destination axis (source pixels
+        // per destination axis before the transform swaps them).
+        let (gw, gh) = match transform {
+            4 | 5 | 6 | 7 => (src_h, src_w),
+            _ => (src_w, src_h),
+        };
+        for oy in 0..dh {
+            for ox in 0..dw {
+                // Destination pixel -> logical position on the
+                // transform's grid, then the inverse transform
+                // gives the source pixel.
+                let lx = ox * gw / dw;
+                let ly = oy * gh / dh;
+                let (col, row) = match transform {
+                    0 => (lx, ly),
+                    1 => (lx, src_h - 1 - ly),
+                    2 => (src_w - 1 - lx, ly),
+                    3 => (src_w - 1 - lx, src_h - 1 - ly),
+                    4 => (ly, lx),
+                    5 => (ly, src_h - 1 - lx),
+                    6 => (src_w - 1 - ly, lx),
+                    7 => (src_w - 1 - ly, src_h - 1 - lx),
+                    _ => (lx, ly),
+                };
                 let sx = src_x + col;
                 let sy = src_y + row;
                 if sx < 0 || sy < 0 || sx as usize >= img.width || sy as usize >= img.height {
                     continue;
                 }
                 let p = img.pixel(sx as usize, sy as usize);
-                // Map (col, row) in source space to destination offset.
-                let (ox, oy) = match transform {
-                    0 => (col, row),
-                    1 => (col, src_h - 1 - row), // mirror_rot180: flip Y
-                    2 => (src_w - 1 - col, row), // mirror: flip X
-                    3 => (src_w - 1 - col, src_h - 1 - row), // rot180
-                    4 => (row, col), // mirror_rot270: mirror, then rot270
-                    5 => (src_h - 1 - row, col), // rot90
-                    6 => (row, src_w - 1 - col), // rot270
-                    7 => (src_h - 1 - row, src_w - 1 - col), // mirror_rot90
-                    _ => (col, row),
-                };
-                // Rotation transforms 4-7 follow the MIDP transform table
-                // (mirror/rotate compositions); the game's sprite path
-                // itself only uses 0-3, which are the flip combinations.
                 self.put(fb, dx + ox, dy + oy, p);
             }
         }
@@ -298,18 +352,23 @@ pub fn draw_sprite_frame(
     } else {
         -(frame.anchor_y + frame.h)
     };
-    let mut sw = frame.w;
-    let mut sh = frame.h;
-    let mut sx = frame.src_x;
-    let mut sy = frame.src_y;
+    // Source rect in image pixels: the frame table is in logical
+    // pixels, the image may be an HD sheet (scale 4).
+    let img_scale = img.scale.max(1) as i32;
+    let mut sw = frame.w * img_scale;
+    let mut sh = frame.h * img_scale;
+    let mut sx = frame.src_x * img_scale;
+    let mut sy = frame.src_y * img_scale;
     if sx < 0 {
+        // Clipping shifts the destination by the clipped amount in
+        // logical (game) pixels, i.e. image pixels / img.scale.
         sw += sx;
-        dx += sx;
+        dx += sx / img_scale;
         sx = 0;
     }
     if sy < 0 {
         sh += sy;
-        dy += sy;
+        dy += sy / img_scale;
         sy = 0;
     }
     if sx + sw > img.width as i32 {

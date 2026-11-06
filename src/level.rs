@@ -200,8 +200,12 @@ pub fn parse_level_from_reader(id: u32, br: &mut BitReader) -> Result<Level, RpE
 /// 16x16, taken row-major from the tileset (8 per row).
 pub fn draw_view(level: &Level, tileset: &Image, fb: &mut Framebuffer, cam_x: i32, cam_y: i32) {
     fb.clear(0xFF00_0000);
+    // Source tile size in image pixels (16 logical px * image scale);
+    // destination tile size in framebuffer pixels (16 * fb scale).
+    let sw = 16i32 * tileset.scale.max(1) as i32;
+    let dw = 16i32 * fb.scale as i32;
     let tile_w = 16i32;
-    let cols = (tileset.width as i32 / tile_w).max(1);
+    let cols = (tileset.width as i32 / sw).max(1);
     let x0 = (cam_x / tile_w).max(0) as usize;
     let y0 = (cam_y / tile_w).max(0) as usize;
     let x1 = ((cam_x + 240 + tile_w - 1) / tile_w).min(level.width_tiles as i32) as usize;
@@ -209,13 +213,16 @@ pub fn draw_view(level: &Level, tileset: &Image, fb: &mut Framebuffer, cam_x: i3
     for ty in y0..y1 {
         for tx in x0..x1 {
             let tile = level.tile_at(tx, ty) as i32;
-            let sx = (tile % cols) * tile_w;
-            let sy = (tile / cols) * tile_w;
-            let dx = tx as i32 * tile_w - cam_x;
-            let dy = ty as i32 * tile_w - cam_y;
-            for py in 0..tile_w {
-                for px in 0..tile_w {
-                    let sp = tileset.pixel((sx + px) as usize, (sy + py) as usize);
+            let sx = (tile % cols) * sw;
+            let sy = (tile / cols) * sw;
+            let dx = (tx as i32 * tile_w - cam_x) * fb.scale as i32;
+            let dy = (ty as i32 * tile_w - cam_y) * fb.scale as i32;
+            for py in 0..dw {
+                for px in 0..dw {
+                    let sp = tileset.pixel(
+                        (sx + px * sw / dw) as usize,
+                        (sy + py * sw / dw) as usize,
+                    );
                     if (sp >> 24) & 0xFF == 0 {
                         continue;
                     }
@@ -231,18 +238,21 @@ pub fn draw_view(level: &Level, tileset: &Image, fb: &mut Framebuffer, cam_x: i3
 }
 
 /// Render the whole level to an Image (for inspection / tests).
+/// Output is always at logical (1x) resolution; an HD tileset is
+/// nearest-downsampled to it.
 pub fn draw_full(level: &Level, tileset: &Image) -> Image {
     let mut img = Image::from_argb(level.pixel_width(), level.pixel_height(), vec![0; level.pixel_width() * level.pixel_height()]).unwrap();
     let tile_w = 16i32;
-    let cols = (tileset.width as i32 / tile_w).max(1);
+    let sw = tile_w * tileset.scale.max(1) as i32;
+    let cols = (tileset.width as i32 / sw).max(1);
     for ty in 0..level.height_tiles {
         for tx in 0..level.width_tiles {
             let tile = level.tile_at(tx, ty) as i32;
-            let sx = (tile % cols) * tile_w;
-            let sy = (tile / cols) * tile_w;
+            let sx = (tile % cols) * sw;
+            let sy = (tile / cols) * sw;
             for py in 0..tile_w {
                 for px in 0..tile_w {
-                    let sp = tileset.pixel((sx + px) as usize, (sy + py) as usize);
+                    let sp = tileset.pixel((sx + px * sw / tile_w) as usize, (sy + py * sw / tile_w) as usize);
                     if (sp >> 24) & 0xFF == 0 {
                         continue;
                     }

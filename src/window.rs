@@ -78,6 +78,50 @@ pub fn scale_nearest(src: &Framebuffer, factor: usize) -> Framebuffer {
     out
 }
 
+/// Bilinear scaling to an arbitrary size (used to fit the rendered
+/// framebuffer into the window, e.g. an HD 960x1280 frame into a
+/// 720x960 window, or any frame into a fullscreen window). Unlike
+/// `scale_nearest` this is smooth, which suits the already-smooth
+/// HD art and non-integer fit scales; integer upscales of SD art
+/// should keep using `scale_nearest` for crisp pixels.
+pub fn scale_bilinear(src: &Framebuffer, w: usize, h: usize) -> Framebuffer {
+    let mut out = Framebuffer::new(w, h);
+    if w == 0 || h == 0 || src.width == 0 || src.height == 0 {
+        return out;
+    }
+    for y in 0..h {
+        // Centre of the destination pixel in source coordinates.
+        let sy = ((y as f64 + 0.5) * src.height as f64 / h as f64 - 0.5)
+            .clamp(0.0, (src.height - 1) as f64);
+        let y0 = sy.floor() as usize;
+        let y1 = (y0 + 1).min(src.height - 1);
+        let fy = sy - y0 as f64;
+        for x in 0..w {
+            let sx = ((x as f64 + 0.5) * src.width as f64 / w as f64 - 0.5)
+                .clamp(0.0, (src.width - 1) as f64);
+            let x0 = sx.floor() as usize;
+            let x1 = (x0 + 1).min(src.width - 1);
+            let fx = sx - x0 as f64;
+            let p00 = src.pixels[y0 * src.width + x0];
+            let p10 = src.pixels[y0 * src.width + x1];
+            let p01 = src.pixels[y1 * src.width + x0];
+            let p11 = src.pixels[y1 * src.width + x1];
+            let mut px = 0u32;
+            for shift in [24, 16, 8, 0] {
+                let c00 = ((p00 >> shift) & 0xFF) as f64;
+                let c10 = ((p10 >> shift) & 0xFF) as f64;
+                let c01 = ((p01 >> shift) & 0xFF) as f64;
+                let c11 = ((p11 >> shift) & 0xFF) as f64;
+                let c = (c00 * (1.0 - fx) + c10 * fx) * (1.0 - fy)
+                    + (c01 * (1.0 - fx) + c11 * fx) * fy;
+                px |= ((c.round() as u32) & 0xFF) << shift;
+            }
+            out.pixels[y * w + x] = px;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -99,5 +143,25 @@ mod tests {
         let src = crate::midp::Framebuffer::game();
         let out = super::scale_nearest(&src, 3);
         assert_eq!((out.width, out.height), (720, 960));
+    }
+
+    #[test]
+    fn scale_bilinear_midpoint_and_identity() {
+        // 2x1 red->blue: the midpoint of a 4x2 bilinear scale is purple.
+        let mut src = crate::midp::Framebuffer::new(2, 1);
+        src.pixels = vec![0xFFFF_0000, 0xFF00_00FF];
+        let out = super::scale_bilinear(&src, 4, 2);
+        assert_eq!((out.width, out.height), (4, 2));
+        // The 2x1 -> 4x2 scale is a smooth red-to-blue gradient:
+        // x=1 samples mostly red, x=2 mostly blue.
+        let left = out.pixels[1 * 4 + 1];
+        assert!(((left >> 16) & 0xFF) > 150, "left red");
+        assert!((left & 0xFF) < 100, "left blue");
+        let right = out.pixels[1 * 4 + 2];
+        assert!(((right >> 16) & 0xFF) < 100, "right red");
+        assert!((right & 0xFF) > 150, "right blue");
+        // Identity size reproduces the source.
+        let same = super::scale_bilinear(&src, 2, 1);
+        assert_eq!(same.pixels, src.pixels);
     }
 }

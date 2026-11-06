@@ -565,9 +565,9 @@ Still not ported: state-79 flame / cs=266/243
 remainder (3GP video, other MIDI chunks, boot
 cases, RP chunk types, `hs` gold cap). 168/168 tests.
 
-Two user-reported bugs from v1.4.0 are fixed (not yet shipped, see
-../REPORT.md): silent music — the MIDI parser never consumed the
-first data byte in the running-status branch, so the slot-0 song
+Two user-reported bugs from v1.4.0 are fixed and shipped as v1.4.1
+(see ../REPORT.md): silent music — the MIDI parser never consumed
+the first data byte in the running-status branch, so the slot-0 song
 parsed as 38 note-ons / 2363 note-offs; now 867/867 — and the
 screen shaking up and down — the base camera measured its delta
 from the final camera instead of the base camera, so the vertical
@@ -575,8 +575,22 @@ zones at y=416 flickered on the edge of the base viewport; now
 cam_y is stable at 304 with zone_j at the snap value 122.
 
 ## Next steps (see ../REPORT.md)
-1. Ship the v1.4.1 bugfixes when the user says so (work complete, verified, not pushed).
-2. First live `--play-window` run and first MIDI listen on the user's PC (standing item — only he can do this).
+1. First live `--play-window` run and first MIDI listen on the user's PC (standing item — only he can do this).
 
 The original jar is loaded from the user's own copy at runtime; no Glu
 assets are redistributed in this repo.
+
+## HD art (v1.5.0, 2026-11-06 — not shipped yet)
+
+The game's sprites are AI-upscaled 4x (Real-ESRGAN `realesrgan-x4plus-anime`)
+and the port renders at 960x1280 from them. The art pack is NOT in the repo
+(it is upscaled Glu art — generated from your own jar, for your own use):
+drop the `hd/` folder next to the RP packs and the window enables HD
+automatically (it prints "HD art enabled"). Without `hd/`, the game falls
+back to the original sprites. `--hd` enables it for `--scene` / `--game`.
+F11 toggles borderless fullscreen; the frame is fitted to the window
+preserving 3:4 (nearest for integer SD upscale, bilinear otherwise).
+Implementation: `Image.scale` / `Framebuffer.scale` + `game_scaled()`,
+destination-driven `draw_region`, scale-aware `draw_view`, HD lookup in
+`Resources::image()` (verified exactly 4x, else jar fallback). Generator:
+`hd/batch_upscale.py` + `hd/upscale_tileset.py` (tile-by-tile, no seams).

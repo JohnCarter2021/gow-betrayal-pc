@@ -1124,7 +1124,7 @@ self.state = State::Playing;
     pub fn draw(&mut self, fb: &mut Framebuffer) {
         fb.clear(0xFF00_0000);
         let mut g = Graphics::default();
-        g.set_clip_full(240, 320);
+        g.set_clip_full(fb.width as i32, fb.height as i32);
         let Some(font) = &self.font else {
             return;
         };

@@ -2510,6 +2510,53 @@ mod tests {
         assert!(!gp.script.boss_latched());
     }
 
+    /// HD render (v1.5.0): the same scene rendered from HD sheets
+    /// must be 960x1280, drawn (not blank), and laid out exactly like
+    /// the SD render — downsampling the HD frame by 4 must reproduce
+    /// the SD frame's drawn silhouette. This catches a wrong render
+    /// scale, a missing HD sheet, or a frame drawn at the wrong place.
+    #[test]
+    fn hd_render_matches_sd_layout() {
+        // SD reference.
+        let mut res_sd = crate::resources::Resources::new("../extracted");
+        let mut gp_sd = super::Gameplay::load(&mut res_sd, 9217, false).unwrap();
+        gp_sd.dismiss_intro();
+        drain_script(&mut gp_sd, &mut res_sd);
+        let font_sd = crate::font::Font::from_sprite_set(
+            res_sd.sprite_set(1031, None).expect("font 1031"),
+        );
+        let mut fb_sd = crate::midp::Framebuffer::game();
+        gp_sd.draw(&mut fb_sd, &mut res_sd, &font_sd);
+        // HD render of the same state.
+        let mut res_hd = crate::resources::Resources::new("../extracted");
+        assert!(res_hd.enable_hd(), "hd/ should exist");
+        let mut gp_hd = super::Gameplay::load(&mut res_hd, 9217, false).unwrap();
+        gp_hd.dismiss_intro();
+        drain_script(&mut gp_hd, &mut res_hd);
+        let font_hd = crate::font::Font::from_sprite_set(
+            res_hd.sprite_set(1031, None).expect("font 1031"),
+        );
+        let mut fb_hd = crate::midp::Framebuffer::game_scaled(res_hd.render_scale());
+        assert_eq!((fb_hd.width, fb_hd.height), (960, 1280));
+        gp_hd.draw(&mut fb_hd, &mut res_hd, &font_hd);
+        let drawn_hd = fb_hd.pixels.iter().filter(|&&p| p != 0xFF00_0000).count();
+        assert!(drawn_hd > 100_000, "HD frame should be mostly drawn, got {drawn_hd}");
+        // Silhouette agreement after downsampling by 4.
+        let (mut agree, mut total) = (0usize, 0usize);
+        for y in 0..320 {
+            for x in 0..240 {
+                let sd_drawn = fb_sd.pixels[y * 240 + x] != 0xFF00_0000;
+                let hd_drawn = fb_hd.pixels[(y * 4) * 960 + (x * 4)] != 0xFF00_0000;
+                total += 1;
+                if sd_drawn == hd_drawn {
+                    agree += 1;
+                }
+            }
+        }
+        let pct = agree * 100 / total;
+        assert!(pct >= 90, "HD/SD silhouette agreement {pct}%");
+    }
+
     /// Phase 8: collectibles are drawn (set 5120,
     /// slots 121+n, action `ft`) at their position
     /// while uncollected, and hidden once collected.

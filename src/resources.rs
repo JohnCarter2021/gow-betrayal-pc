@@ -14,9 +14,15 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// HD art scale: AI-upscaled sheets are 4x the jar's sheets.
+pub const HD_SCALE: usize = 4;
+
 pub struct Resources {
     dir: PathBuf,
     packs: HashMap<u32, RpPack>,
+    /// True once HD art is enabled (see `enable_hd`): sprite images
+    /// are then loaded from `<dir>/hd/` when a matching file exists.
+    pub hd_enabled: bool,
 }
 
 impl Resources {
@@ -24,7 +30,52 @@ impl Resources {
         Resources {
             dir: dir.as_ref().to_path_buf(),
             packs: HashMap::new(),
+            hd_enabled: false,
         }
+    }
+
+    /// Enable HD art if an `hd/` folder with upscaled sheets sits next
+    /// to the RP packs. Returns true when HD is active. Off by default
+    /// so tests and headless modes keep the original art unless they
+    /// ask for HD explicitly; the window enables it when present.
+    pub fn enable_hd(&mut self) -> bool {
+        let hd = self.dir.join("hd");
+        let on = hd.is_dir()
+            && fs::read_dir(&hd)
+                .map(|mut it| it.any(|e| {
+                    e.map(|e| {
+                        e.path()
+                            .extension()
+                            .map(|x| x == "png")
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+                }))
+                .unwrap_or(false);
+        self.hd_enabled = on;
+        on
+    }
+
+    /// Framebuffer render scale for this resource set: 4 with HD art
+    /// (960x1280), 1 otherwise (240x320).
+    pub fn render_scale(&self) -> usize {
+        if self.hd_enabled {
+            HD_SCALE
+        } else {
+            1
+        }
+    }
+
+    /// HD sheet file for an image: `<dir>/hd/{image_id}_{key_id}.png`
+    /// where key_id is the palette-key resource id, or 0 for the base
+    /// palette. Files are produced by `hd/batch_upscale.py` (4x
+    /// Real-ESRGAN) from the user's own jar.
+    fn hd_path(&self, id: u32, palette_key_id: Option<u32>) -> PathBuf {
+        self.dir.join("hd").join(format!(
+            "{}_{}.png",
+            id,
+            palette_key_id.unwrap_or(0)
+        ))
     }
 
     fn pack(&mut self, file: u32) -> Result<&RpPack, RpError> {
@@ -63,7 +114,35 @@ impl Resources {
 
     /// PNG image (RP flag 253), optionally with a palette key applied
     /// (`a.c`: key chunk id, or None for the base palette).
+    /// With HD enabled, an upscaled sheet in `hd/` is used instead
+    /// when one exists for this (image, key) and is exactly 4x the
+    /// jar image; otherwise the jar image is used (scale 1).
     pub fn image(&mut self, id: u32, palette_key_id: Option<u32>) -> Result<Image, RpError> {
+        if self.hd_enabled {
+            let path = self.hd_path(id, palette_key_id);
+            if let Ok(bytes) = fs::read(&path) {
+                if let Ok(mut img) = Image::from_png(&bytes) {
+                    // Verify against the jar image: an HD sheet must
+                    // be exactly HD_SCALE times the original, else a
+                    // stale or wrong file would corrupt every frame.
+                    if let Ok(orig) = self.image_from_jar(id, palette_key_id) {
+                        if img.width == orig.width * HD_SCALE
+                            && img.height == orig.height * HD_SCALE
+                        {
+                            img.scale = HD_SCALE;
+                            return Ok(img);
+                        }
+                        return Ok(orig);
+                    }
+                    img.scale = HD_SCALE;
+                    return Ok(img);
+                }
+            }
+        }
+        self.image_from_jar(id, palette_key_id)
+    }
+
+    fn image_from_jar(&mut self, id: u32, palette_key_id: Option<u32>) -> Result<Image, RpError> {
         let mut png = self.chunk(id)?;
         if let Some(key_id) = palette_key_id {
             let key = self.chunk(key_id)?;
@@ -102,5 +181,42 @@ pub struct SpriteSet {
 impl SpriteSet {
     pub fn frame(&self, index: usize) -> Option<&Frame> {
         self.frames.get(index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hd_sheets_load_at_4x_with_matching_dimensions() {
+        let mut res = Resources::new("../extracted");
+        assert_eq!(res.render_scale(), 1);
+        assert!(res.enable_hd(), "hd/ folder should exist in ../extracted");
+        assert_eq!(res.render_scale(), HD_SCALE);
+        // Tileset: base palette.
+        let base = res.image(2058, None).unwrap();
+        assert_eq!(base.scale, HD_SCALE);
+        let orig = res.image_from_jar(2058, None).unwrap();
+        assert_eq!(base.width, orig.width * HD_SCALE);
+        assert_eq!(base.height, orig.height * HD_SCALE);
+        // A level-3 palette variant of the tileset (key 2070).
+        let var = res.image(2058, Some(2070)).unwrap();
+        assert_eq!(var.scale, HD_SCALE);
+        assert_eq!(var.width, orig.width * HD_SCALE);
+        // Sprite set: the image is HD, the frame table stays logical.
+        let set = res.sprite_set(28673, None).unwrap();
+        assert_eq!(set.image.scale, HD_SCALE);
+        assert_eq!(set.image.width, 258 * HD_SCALE);
+        assert_eq!(set.image.height, 55 * HD_SCALE);
+        assert!(set.frames.iter().all(|f| f.w <= 29 && f.h <= 18));
+    }
+
+    #[test]
+    fn hd_disabled_by_default_and_falls_back_without_hd() {
+        let mut res = Resources::new("../extracted");
+        assert!(!res.hd_enabled);
+        let img = res.image(2058, None).unwrap();
+        assert_eq!(img.scale, 1);
     }
 }

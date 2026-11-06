@@ -330,17 +330,20 @@ pub fn decode_png(data: &[u8]) -> Result<DecodedPng, PngError> {
     if width == 0 || height == 0 {
         return Err(PngError("PNG has no IHDR".into()));
     }
-    if bit_depth != 8 || color_type != 3 || interlace != 0 {
+    if bit_depth != 8 || (color_type != 3 && color_type != 6) || interlace != 0 {
         return Err(PngError(format!(
-            "unsupported PNG: bit_depth={bit_depth} color_type={color_type} interlace={interlace} (game sheets are 8-bit palette, non-interlaced)"
+            "unsupported PNG: bit_depth={bit_depth} color_type={color_type} interlace={interlace} (game sheets are 8-bit palette, HD sheets are 8-bit RGBA, both non-interlaced)"
         )));
     }
-    if palette.is_empty() {
+    if color_type == 3 && palette.is_empty() {
         return Err(PngError("palette PNG without PLTE".into()));
     }
     let raw = inflate(&idat)?;
-    // One filter byte per scanline, 1 byte per pixel (palette index).
-    let stride = width + 1;
+    // Bytes per pixel: 1 for palette indices, 4 for RGBA.
+    // PNG filters operate per byte with bpp = bytes per pixel.
+    let bpp = if color_type == 3 { 1 } else { 4 };
+    // One filter byte per scanline, then width*bpp data bytes.
+    let stride = width * bpp + 1;
     if raw.len() < height * stride {
         return Err(PngError(format!(
             "inflated data too short: {} < {}",
@@ -348,18 +351,18 @@ pub fn decode_png(data: &[u8]) -> Result<DecodedPng, PngError> {
             height * stride
         )));
     }
-    let mut indices = vec![0u8; width * height];
-    let mut prev: Vec<u8> = vec![0; width];
+    let mut bytes = vec![0u8; width * height * bpp];
+    let mut prev: Vec<u8> = vec![0; width * bpp];
     for y in 0..height {
         let filter = raw[y * stride];
         let row = &raw[y * stride + 1..(y + 1) * stride];
-        let mut cur = vec![0u8; width];
-        for x in 0..width {
-            let a = if x > 0 { cur[x - 1] as i32 } else { 0 };
-            let b = prev[x] as i32;
-            let c = if x > 0 { prev[x - 1] as i32 } else { 0 };
-            let v = row[x] as i32;
-            cur[x] = match filter {
+        let mut cur = vec![0u8; width * bpp];
+        for i in 0..width * bpp {
+            let a = if i >= bpp { cur[i - bpp] as i32 } else { 0 };
+            let b = prev[i] as i32;
+            let c = if i >= bpp { prev[i - bpp] as i32 } else { 0 };
+            let v = row[i] as i32;
+            cur[i] = match filter {
                 0 => v as u8,
                 1 => (v + a) as u8,
                 2 => (v + b) as u8,
@@ -368,19 +371,31 @@ pub fn decode_png(data: &[u8]) -> Result<DecodedPng, PngError> {
                 _ => return Err(PngError(format!("unknown PNG filter {filter}"))),
             };
         }
-        indices[y * width..(y + 1) * width].copy_from_slice(&cur);
+        bytes[y * width * bpp..(y + 1) * width * bpp].copy_from_slice(&cur);
         prev = cur;
     }
     let mut pixels = Vec::with_capacity(width * height);
-    for &idx in &indices {
-        let rgb = palette.get(idx as usize).copied().unwrap_or([0, 0, 0]);
-        let alpha = trns.get(idx as usize).copied().unwrap_or(255);
-        pixels.push(
-            ((alpha as u32) << 24)
-                | ((rgb[0] as u32) << 16)
-                | ((rgb[1] as u32) << 8)
-                | (rgb[2] as u32),
-        );
+    if color_type == 3 {
+        for &idx in bytes.iter() {
+            let rgb = palette.get(idx as usize).copied().unwrap_or([0, 0, 0]);
+            let alpha = trns.get(idx as usize).copied().unwrap_or(255);
+            pixels.push(
+                ((alpha as u32) << 24)
+                    | ((rgb[0] as u32) << 16)
+                    | ((rgb[1] as u32) << 8)
+                    | (rgb[2] as u32),
+            );
+        }
+    } else {
+        // RGBA: bytes are R, G, B, A per pixel.
+        for px in bytes.chunks_exact(4) {
+            pixels.push(
+                ((px[3] as u32) << 24)
+                    | ((px[0] as u32) << 16)
+                    | ((px[1] as u32) << 8)
+                    | (px[2] as u32),
+            );
+        }
     }
     Ok(DecodedPng {
         width,
@@ -453,4 +468,24 @@ pub fn encode_png_rgba(width: usize, height: usize, rgba: &[u8]) -> Vec<u8> {
     write_chunk(&mut out, b"IDAT", &z);
     write_chunk(&mut out, b"IEND", &[]);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgba_roundtrip_preserves_pixels_including_alpha() {
+        // 2x2: opaque red, semi-transparent green, transparent blue, opaque white.
+        let rgba: [u8; 16] = [
+            255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, 255, 255, 255, 255,
+        ];
+        let bytes = encode_png_rgba(2, 2, &rgba);
+        let d = decode_png(&bytes).unwrap();
+        assert_eq!((d.width, d.height), (2, 2));
+        assert_eq!(d.pixels[0], 0xFFFF_0000);
+        assert_eq!(d.pixels[1], 0x8000_FF00);
+        assert_eq!(d.pixels[2], 0x0000_00FF);
+        assert_eq!(d.pixels[3], 0xFFFF_FFFF);
+    }
 }

@@ -34,12 +34,17 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::game::{Game, Input, State};
 use crate::midp::Framebuffer;
-use crate::window::scale_nearest;
+use crate::window::{scale_bilinear, scale_nearest};
 
 pub fn run(dir: &std::path::Path, factor: usize, save_dir: Option<&str>) -> i32 {
     let mut game = Game::new(dir);
     if let Some(sd) = save_dir {
         game.set_save_dir(sd);
+    }
+    // HD art: if an hd/ folder with AI-upscaled sheets sits next to
+    // the RP packs, the game renders at 4x (960x1280) from it.
+    if game.res.enable_hd() {
+        eprintln!("HD art enabled: rendering at 960x1280 from hd/ sheets");
     }
     if let Err(e) = game.boot() {
         eprintln!("boot failed: {e}");
@@ -129,23 +134,52 @@ impl App {
     }
 
     fn render(&mut self) {
-        if self.window.is_none() {
+        let Some(window) = &self.window else { return };
+        let Some(surface) = &mut self.surface else { return };
+        // Render at the game's scale (1x = 240x320, HD = 960x1280).
+        let scale = self.game.res.render_scale();
+        let mut fb = Framebuffer::game_scaled(scale);
+        self.game.draw(&mut fb);
+        // Fit the frame into the window, preserving the 3:4 aspect,
+        // centred on black. SD art keeps crisp integer nearest
+        // scaling; HD art (and any non-integer fit) uses bilinear.
+        let size = window.inner_size();
+        let (ww, wh) = (size.width as usize, size.height as usize);
+        if ww == 0 || wh == 0 {
             return;
         }
-        let Some(surface) = &mut self.surface else { return };
-        let w = 240 * self.factor as u32;
-        let h = 320 * self.factor as u32;
-        let mut fb = Framebuffer::game();
-        self.game.draw(&mut fb);
-        let scaled = scale_nearest(&fb, self.factor);
-        debug_assert_eq!(scaled.width as u32, w);
-        debug_assert_eq!(scaled.height as u32, h);
+        let fit = ((ww as f64 / fb.width as f64).min(wh as f64 / fb.height as f64))
+            .max(0.0);
+        let (out_w, out_h) = (
+            ((fb.width as f64 * fit).round() as usize).max(1),
+            ((fb.height as f64 * fit).round() as usize).max(1),
+        );
+        let scaled = if fb.scale == 1 && (fit - fit.round()).abs() < 1e-6 && fit >= 1.0 {
+            scale_nearest(&fb, fit.round() as usize)
+        } else {
+            scale_bilinear(&fb, out_w, out_h)
+        };
         let Ok(mut buffer) = surface.buffer_mut() else { return };
-        // softbuffer pixels are 0x00RRGGBB; our ARGB pixels just
-        // drop the alpha channel (the game never draws alpha 0
-        // as a visible colour — alpha 0 pixels are skipped).
-        for (dst, &src) in buffer.iter_mut().zip(scaled.pixels.iter()) {
-            *dst = src & 0x00FF_FFFF;
+        // Black letterbox, then the centred frame.
+        for dst in buffer.iter_mut() {
+            *dst = 0;
+        }
+        let ox = (ww.saturating_sub(scaled.width)) / 2;
+        let oy = (wh.saturating_sub(scaled.height)) / 2;
+        for y in 0..scaled.height {
+            if oy + y >= wh {
+                break;
+            }
+            for x in 0..scaled.width {
+                if ox + x >= ww {
+                    break;
+                }
+                // softbuffer pixels are 0x00RRGGBB; our ARGB pixels just
+                // drop the alpha channel (the game never draws alpha 0
+                // as a visible colour — alpha 0 pixels are skipped).
+                buffer[(oy + y) * ww + (ox + x)] =
+                    scaled.pixels[y * scaled.width + x] & 0x00FF_FFFF;
+            }
         }
         let _ = buffer.present();
     }
@@ -223,6 +257,21 @@ impl App {
                     self.game.update(Some(Input::Exit));
                 }
             }
+            KeyCode::F11 => {
+                // Fullscreen toggle: borderless on the current monitor,
+                // back to windowed on the next press. The Resized event
+                // re-fits the surface; render() centres the frame.
+                if pressed {
+                    if let Some(window) = &self.window {
+                        let fs = if window.fullscreen().is_some() {
+                            None
+                        } else {
+                            Some(winit::window::Fullscreen::Borderless(None))
+                        };
+                        window.set_fullscreen(fs);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -288,6 +337,21 @@ impl ApplicationHandler for App {
     ) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                // Fullscreen toggle / monitor change: re-fit the surface
+                // to the new window size; render() centres the frame.
+                if let Some(surface) = &mut self.surface {
+                    if size.width > 0 && size.height > 0 {
+                        let _ = surface.resize(
+                            NonZeroU32::new(size.width).unwrap(),
+                            NonZeroU32::new(size.height).unwrap(),
+                        );
+                    }
+                }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 self.on_key(&event);
                 if self.game.exited {

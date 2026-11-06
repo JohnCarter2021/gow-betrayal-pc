@@ -2,15 +2,15 @@
 
 A Rust PC port, in progress, of *God of War: Betrayal* (J2ME, Glu Mobile, v1.4.8).
 
-Status, 2026-11-06 — v1.4.1: everything in v1.4.0, plus two
-bugfixes the user found while playing v1.4.0: silent music — the
-MIDI parser never consumed the first data byte in the
-running-status branch, so the slot-0 song parsed as 38 note-ons /
-2363 note-offs; now 867/867 — and the screen shaking up and down
-— the base camera measured its delta from the final camera
-instead of the base camera, so the vertical zones at y=416
-flickered on the edge of the base viewport; now the camera is
-stable with the zone offset at its snap value:
+Status, 2026-11-06 — v1.5.0: everything in v1.4.1, plus HD art — every
+sprite the game loads (34 sheets + 8 palette variants) AI-upscaled 4x
+(Real-ESRGAN x4plus-anime), and the port renders at 960x1280 from an
+`hd/` folder next to the RP packs, falling back to the original sprites
+without it. F11 toggles borderless fullscreen; the frame is fitted to
+the window preserving 3:4. The HD art pack itself is NOT in this repo
+(it is upscaled Glu art, generated from the user's own jar); the port
+loads it when present. `--hd` enables HD for the headless `--scene` /
+`--game` modes.
 
 - **MIDP shim, std-only, no crates:** 240×320 framebuffer, `Graphics`
   (clip / translate / `drawRegion` with all 8 MIDP transforms), sprite

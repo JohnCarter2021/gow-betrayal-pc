@@ -225,18 +225,25 @@ fn main() {
         }
         return;
     }
+    // --hd: enable AI-upscaled HD art (hd/ next to the RP packs) for
+    // the modes that render frames (--scene, --game). The live window
+    // (--play-window) enables it automatically when present.
+    let hd = args.iter().any(|a| a == "--hd");
     if args.get(2).map(|s| s.as_str()) == Some("--scene") {
-        // --scene <level-id> [cam_x cam_y] [out-prefix]
+        // --scene <level-id> [cam_x cam_y] [out-prefix] [--hd]
         // Tiles (3a) + type-23 static sprites (3b-3), at a camera.
         let level_id: u32 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(9217);
         let cam_x: i32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
         let cam_y: i32 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
         let prefix = args.get(6).map(|s| s.as_str()).unwrap_or("../scene-frame");
         let mut res = resources::Resources::new(&target);
+        if hd {
+            res.enable_hd();
+        }
         let chunk = res.chunk(level_id).expect("level chunk");
         let parsed = entities::parse_level_entities(level_id, &chunk).expect("parse entities");
         let tileset = res.image(2058, None).expect("tileset 2058");
-        let mut fb = midp::Framebuffer::game();
+        let mut fb = midp::Framebuffer::game_scaled(res.render_scale());
         level::draw_view(&parsed.level, &tileset, &mut fb, cam_x, cam_y);
         // Static sprites: anim set 3073, sprite set 3076 (both RP3,
         // base palette — bC=0 -> bG[0]=-1, no key, as in case 4).
@@ -1333,17 +1340,20 @@ fn main() {
         return;
     }
     if args.get(2).map(|s| s.as_str()) == Some("--game") {
-        // --game <out-prefix> [comma-separated keys: up,down,left,right,select,exit]
+        // --game <out-prefix> [comma-separated keys: up,down,left,right,select,exit] [--hd]
         // Boots (slice 1), draws LanguageSelect, applies the keys, draws
         // the resulting state. Example:
         //   --game ../game-frame down,down,select
         let prefix = args.get(3).map(|s| s.as_str()).unwrap_or("../game-frame");
         let mut g = game::Game::new(&target);
+        if hd {
+            g.res.enable_hd();
+        }
         if let Some(dir) = args.get(5) {
             g.set_save_dir(dir);
         }
         g.boot().expect("boot");
-        let mut fb = midp::Framebuffer::game();
+        let mut fb = midp::Framebuffer::game_scaled(g.res.render_scale());
         g.draw(&mut fb);
         let rgba = fb.to_rgba();
         fs::write(
@@ -1394,7 +1404,7 @@ fn main() {
                 _ => g.tick(40),
             }
         }
-        let mut fb2 = midp::Framebuffer::game();
+        let mut fb2 = midp::Framebuffer::game_scaled(g.res.render_scale());
         g.draw(&mut fb2);
         let rgba2 = fb2.to_rgba();
         fs::write(
