@@ -563,10 +563,19 @@ Still not ported: state-79 flame / cs=266/243
 (tied to the dS machinery), walk/attack-from-block
 (needs press-edge input), and the untraced
 remainder (3GP video, other MIDI chunks, boot
-cases, RP chunk types, `hs` gold cap). 165/165 tests.
+cases, RP chunk types, `hs` gold cap). 168/168 tests.
+
+Two user-reported bugs from v1.4.0 are fixed (not yet shipped, see
+../REPORT.md): silent music — the MIDI parser never consumed the
+first data byte in the running-status branch, so the slot-0 song
+parsed as 38 note-ons / 2363 note-offs; now 867/867 — and the
+screen shaking up and down — the base camera measured its delta
+from the final camera instead of the base camera, so the vertical
+zones at y=416 flickered on the edge of the base viewport; now
+cam_y is stable at 304 with zone_j at the snap value 122.
 
 ## Next steps (see ../REPORT.md)
-1. Ship the dS work as v1.4.0 when the user says so (work complete, verified, not pushed).
+1. Ship the v1.4.1 bugfixes when the user says so (work complete, verified, not pushed).
 2. First live `--play-window` run and first MIDI listen on the user's PC (standing item — only he can do this).
 
 The original jar is loaded from the user's own copy at runtime; no Glu

@@ -2391,6 +2391,55 @@ mod tests {
         drain_script(gp, res);
     }
 
+    /// Camera-shake regression (v1.4.1): standing
+    /// still at (658,560) in 9217, the vertical
+    /// camera zones at y=416 used to make the whole
+    /// screen shake up and down — cam_y swung
+    /// 273..304 on an 8-tick cycle. Root cause: the
+    /// base camera measured its delta from the
+    /// FINAL camera (base + zone offset), so it
+    /// compensated for the offset and sat `zone_j`
+    /// above the target, putting the zone points on
+    /// the very edge of the base viewport; the zone
+    /// flickered in and out as the base wobbled
+    /// across the edge, pumping the offset up and
+    /// letting it decay. The original measures from
+    /// the base camera (`o()`: n6 - iQ + aI), so the
+    /// base converges on the target and the zone
+    /// stays steadily in view. With that fixed,
+    /// cam_y settles at 304 and zone_j at the snap
+    /// value 122 (416 - 294) and neither moves.
+    #[test]
+    fn camera_does_not_shake_under_vertical_zones() {
+        let mut res = crate::resources::Resources::new("../extracted");
+        let mut gp = super::Gameplay::load(&mut res, 9217, false).unwrap();
+        gp.dismiss_intro();
+        drain_script(&mut gp, &mut res);
+        gp.player.ga = 658;
+        gp.player.gb = 560;
+        gp.player.facing_right = true;
+        // Settle: the base camera slews to the new
+        // target and the zone offset grows to its
+        // snap value (a few ticks each).
+        for _ in 0..30 {
+            t(&mut gp, &mut res, 0, false);
+        }
+        let mut min_cy = i32::MAX;
+        let mut max_cy = i32::MIN;
+        let mut min_zj = i32::MAX;
+        let mut max_zj = i32::MIN;
+        for _ in 0..40 {
+            t(&mut gp, &mut res, 0, false);
+            min_cy = min_cy.min(gp.player.cam_y);
+            max_cy = max_cy.max(gp.player.cam_y);
+            min_zj = min_zj.min(gp.player.cam_zone_j);
+            max_zj = max_zj.max(gp.player.cam_zone_j);
+        }
+        assert_eq!(max_cy - min_cy, 0, "cam_y must not move once settled (was {min_cy}..{max_cy})");
+        assert_eq!(max_zj - min_zj, 0, "zone_j must not move once settled (was {min_zj}..{max_zj})");
+        assert_eq!(gp.player.cam_zone_j, 122, "zone offset is the snap value 416 - 294");
+    }
+
     /// Phase 2: the boss bar latches on an `@`
     /// trigger, animates while latched, and clears
     /// when the player leaves the trigger tiles.

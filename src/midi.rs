@@ -77,8 +77,10 @@ fn parse_track(data: &[u8], out: &mut Vec<RawEvent>) -> Result<(), String> {
         let mut first_data: Option<u8> = None;
         if b < 0x80 {
             // Data byte: running status must already be set.
+            // Consume it: it is the first data byte.
             status = running.ok_or("data byte with no running status")?;
             first_data = Some(b);
+            pos += 1;
         } else {
             pos += 1;
             status = b;
@@ -372,6 +374,69 @@ mod tests {
         v[27] = 0x90;
         let song = parse_song(&v).unwrap();
         assert_eq!(song.events[1].msg & 0xF0, 0x80);
+    }
+
+    /// Running-status regression (v1.4.1, the silent-music bug):
+    /// a second Note On that omits its status byte must parse
+    /// with the right note AND the right velocity. The parser
+    /// used to forget to consume the first data byte in the
+    /// running-status branch, so the velocity byte was read as
+    /// the next event's delta and the whole track desynchronised
+    /// — the slot-0 song came out as 38 note-ons and 2363
+    /// note-offs instead of 867 and 867, i.e. silent.
+    #[test]
+    fn running_status_note_ons_parse_with_correct_notes_and_velocities() {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"MThd");
+        v.extend_from_slice(&6u32.to_be_bytes());
+        v.extend_from_slice(&0u16.to_be_bytes());
+        v.extend_from_slice(&1u16.to_be_bytes());
+        v.extend_from_slice(&96u16.to_be_bytes());
+        let track: [u8; 18] = [
+            0x00, 0x90, 60, 100, // delta 0, note on 60 vel 100
+            0x30, 64, 80, // delta 48, running status: note on 64 vel 80
+            0x30, 67, 90, // delta 48, running status: note on 67 vel 90
+            0x30, 0x80, 60, 0, // delta 48, note off 60
+            0x00, 0xFF, 0x2F, 0x00, // delta 0, end of track
+        ];
+        v.extend_from_slice(b"MTrk");
+        v.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        v.extend_from_slice(&track);
+        let song = parse_song(&v).unwrap();
+        assert_eq!(song.events.len(), 4);
+        assert_eq!(song.events[0].msg, 0x90 | (60 << 8) | (100 << 16));
+        assert_eq!(song.events[1].msg, 0x90 | (64 << 8) | (80 << 16));
+        assert_eq!(song.events[2].msg, 0x90 | (67 << 8) | (90 << 16));
+        assert_eq!(song.events[3].msg, 0x80 | (60 << 8));
+        // 48 ticks at 120 BPM, division 96 = 250 ms each.
+        assert_eq!(song.events[1].delay_ms, 250);
+        assert_eq!(song.events[2].delay_ms, 250);
+        assert_eq!(song.events[3].delay_ms, 250);
+        assert_eq!(song.duration_ms, 750);
+    }
+
+    /// The real slot-0 song (RP1 chunk 39) must parse to the
+    /// note counts an independent parser finds: 867 note-ons
+    /// and 867 note-offs (1752 events). Before the running-
+    /// status fix it parsed as 38 note-ons / 2363 note-offs
+    /// (2422 events) — the music was effectively silent.
+    #[test]
+    fn slot0_song_note_counts_match_independent_parse() {
+        let data = std::fs::read("../extracted/RP1").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        let chunk = pack.chunk(crate::rp::split_resource_id(1063).1).unwrap();
+        let song = parse_song(&chunk).unwrap();
+        let (mut on, mut off) = (0, 0);
+        for e in &song.events {
+            match e.msg & 0xF0 {
+                0x90 => on += 1,
+                0x80 => off += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(song.events.len(), 1752, "total events");
+        assert_eq!(on, 867, "note-ons");
+        assert_eq!(off, 867, "note-offs");
     }
 
     #[test]

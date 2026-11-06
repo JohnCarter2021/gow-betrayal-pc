@@ -1808,16 +1808,30 @@ impl Player {
         // the BASE camera (before the zone offset);
         // `cam_x`/`cam_y` are the final camera (base
         // + zone offset). The delta is measured from
-        // the final camera, as `o()` measures from
-        // `iQ`/`iR` (which already include `aI`/`aJ`).
+        // the BASE camera — `o()` computes
+        // `(n6 - iQ + aI) * L`, i.e. the target minus
+        // the base camera `(iQ - aI)`, not minus the
+        // final camera. Measuring from the final
+        // camera is a bug: the base camera then
+        // compensates for the zone offset, so it sits
+        // `zone_j` above the target and the zone
+        // points end up on the very edge of the base
+        // viewport — the zone flickers in and out as
+        // the base wobbles across the edge, pumping
+        // the offset up and letting it decay, which
+        // shakes the whole screen up and down
+        // (9217: cam_y swung 273..304 on an 8-tick
+        // cycle while the player stood still).
+        let base_x = self.cam_fx >> 8;
+        let base_y = self.cam_fy >> 8;
         let cap = 40 << 8;
-        let mut nx = (target_x - self.cam_x) * 40;
+        let mut nx = (target_x - base_x) * 40;
         if nx > cap {
             nx = cap;
         } else if nx < -cap {
             nx = -cap;
         }
-        let mut ny = (target_y - self.cam_y) * 40;
+        let mut ny = (target_y - base_y) * 40;
         if ny > cap {
             ny = cap;
         } else if ny < -cap {
