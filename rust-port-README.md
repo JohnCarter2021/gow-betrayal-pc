@@ -541,7 +541,7 @@ down, down, Select, Select, and draws the result to
   reached the roof and stalled at the row-14
   platform, tile 143).
 
-## Phase 8 (2026-11-05, work only — NOT shipped; v1.3.0 ship needs the user's go-ahead)
+## Phase 8 (2026-11-05 — SHIPPED as v1.3.0, 2026-11-05 ~22:17 IST, push commit ca41a89, release id 435464576, zip 941,894 bytes, exe 2,536,475 bytes, marked Latest)
 
 Grapple (the fR/fS/fQ button-mashing mini-game,
 4 tests), Artemis anim variants, collectible
@@ -554,16 +554,20 @@ camera zones (horizontal-only, `fj`/`fk`, half
 width from anim 2048 + sprite set 2051), flag-2
 enemy tiles (grounded walking enemies turn at
 flag-2 tiles). Sound slot 3 verified a no-op.
-Investigated and NOT ported: the `dS` enemy
-special attacks (needs the full AI decision
-tree), state-79 flame / cs=266/243 (tied to the
-dS machinery), walk/attack-from-block (needs
-press-edge input), and the untraced remainder
-(3GP video, other MIDI chunks, boot cases, RP
-chunk types, `hs` gold cap). 156/156 tests.
+The `dS` enemy special attacks are also ported
+(the full `i()` setter with the `dS` machine,
+`ei`/`eh`, the grapple freeze guard, and `dM`/`dN`
+with quadrupled health; the trigger and the dive
+with the landing stagger) — see ../REPORT.md.
+Still not ported: state-79 flame / cs=266/243
+(tied to the dS machinery), walk/attack-from-block
+(needs press-edge input), and the untraced
+remainder (3GP video, other MIDI chunks, boot
+cases, RP chunk types, `hs` gold cap). 165/165 tests.
 
 ## Next steps (see ../REPORT.md)
-1. Ship v1.3.0 — only on the user's go-ahead.
+1. Ship the dS work as v1.4.0 when the user says so (work complete, verified, not pushed).
+2. First live `--play-window` run and first MIDI listen on the user's PC (standing item — only he can do this).
 
 The original jar is loaded from the user's own copy at runtime; no Glu
 assets are redistributed in this repo.

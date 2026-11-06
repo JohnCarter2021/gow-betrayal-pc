@@ -2,11 +2,12 @@
 
 A Rust PC port, in progress, of *God of War: Betrayal* (J2ME, Glu Mobile, v1.4.8).
 
-Status, 2026-11-05 — v1.3.0: everything in v1.2.0, plus Phase 8
-complete (grapple — the fR/fS/fQ button-mashing mini-game with the
-slot-131 prompt bar; Artemis anim variants; collectible drawing;
-stagger-13 variant; spawn-in anims 27/14/18; type-7 camera zones;
-flag-2 enemy tiles; sound slot 3 verified a no-op):
+Status, 2026-11-06 — v1.4.0: everything in v1.3.0, plus the `dS`
+enemy special attacks, ported whole (the full `i()` action setter
+with the `dS` state machine, `ei`/`eh` flags, the grapple freeze
+guard, and `dM`/`dN` with quadrupled health; the special-attack
+trigger and the dive with the landing stagger; `dM` deals half
+damage):
 
 - **MIDP shim, std-only, no crates:** 240×320 framebuffer, `Graphics`
   (clip / translate / `drawRegion` with all 8 MIDP transforms), sprite

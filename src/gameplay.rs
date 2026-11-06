@@ -871,9 +871,13 @@ impl Gameplay {
             let eaction = self.cutscene_az[self.cutscene_bb] as usize;
             if eaction != 0 {
                 if let Some(st) = self.enemy_states.get_mut(ti) {
-                    st.action = eaction;
-                    if let Some(anim_set) = &st.anim_set {
-                        st.slot = anim::AnimSlot::new(anim_set, eaction);
+                    // The cutscene's aZ action goes
+                    // through `i()` too (so `dS`
+                    // stays in sync); no grapple is
+                    // active during a cutscene.
+                    st.frozen = false;
+                    if let Some(anim_set) = st.anim_set.clone() {
+                        st.set_action(&anim_set, eaction);
                     }
                 }
             }
@@ -930,13 +934,13 @@ impl Gameplay {
                             return;
                         } else if next_az == 0 {
                             let action = self.cutscene_az[self.cutscene_bb] as usize;
-                            st.action = action;
-                            st.slot = anim::AnimSlot::new(&anim_set, action);
+                            st.frozen = false;
+                            st.set_action(&anim_set, action);
                         } else {
                             self.cutscene_bb += 1;
                             let action = self.cutscene_az[self.cutscene_bb] as usize;
-                            st.action = action;
-                            st.slot = anim::AnimSlot::new(&anim_set, action);
+                            st.frozen = false;
+                            st.set_action(&anim_set, action);
                         }
                     }
                 }
@@ -1389,6 +1393,11 @@ impl Gameplay {
         // grapple action (88/91) with a hurt reaction.
         let grappled = self.grapple.as_ref().map(|gr| gr.enemy);
         for (i, st) in self.enemy_states.iter_mut().enumerate() {
+            // Freeze guard (dS, e.java:4354): while a
+            // grapple is in progress, every enemy
+            // except the grappled one is frozen to
+            // idle — `set_action` enforces it.
+            st.frozen = grappled.is_some() && grappled != Some(i);
             if grappled == Some(i) {
                 continue;
             }
@@ -1914,9 +1923,9 @@ impl Gameplay {
                 st.x = nx;
                 st.y = ny;
                 st.health = st.max_health;
-                st.action = 0;
-                if let Some(anim_set) = &st.anim_set {
-                    st.slot = anim::AnimSlot::new(anim_set, 0);
+                st.frozen = false;
+                if let Some(anim_set) = st.anim_set.clone() {
+                    st.set_action(&anim_set, 0);
                 }
             }
         }
@@ -1977,13 +1986,13 @@ impl Gameplay {
                 // The one-shot (27) runs to its end;
                 // the loops (14/18) run 12 ticks.
                 let action = st.spawn_in_action();
-                st.action = action;
+                st.frozen = false;
+                if let Some(anim_set) = st.anim_set.clone() {
+                    st.set_action(&anim_set, action);
+                }
                 st.spawn_in = if action == 27 { 40 } else { 12 };
                 st.dead = false;
                 st.dying = false;
-                if let Some(anim_set) = &st.anim_set {
-                    st.slot = anim::AnimSlot::new(anim_set, action);
-                }
                 self.flags.set_flag(sx / 16, sy / 16 - 1, 2);
             } else {
                 st.er = 1500;
@@ -3984,7 +3993,10 @@ mod tests {
             .expect("19456 has a kind-12 enemy");
         let (ex, ey) = (gp.enemy_states[idx].x, gp.enemy_states[idx].y);
         gp.enemy_states[idx].dx = 0;
-        gp.enemy_states[idx].action = 0;
+        {
+            let anim_set = gp.enemy_states[idx].anim_set.clone().unwrap();
+            gp.enemy_states[idx].set_action(&anim_set, 0);
+        }
         gp.player.ga = ex - 20;
         gp.player.gb = ey;
         gp.player.action = 0;
@@ -4021,7 +4033,10 @@ mod tests {
             .expect("19456 has a kind-12 enemy");
         let (ex, ey) = (gp.enemy_states[idx].x, gp.enemy_states[idx].y);
         gp.enemy_states[idx].dx = 0;
-        gp.enemy_states[idx].action = 0;
+        {
+            let anim_set = gp.enemy_states[idx].anim_set.clone().unwrap();
+            gp.enemy_states[idx].set_action(&anim_set, 0);
+        }
         gp.player.ga = ex - 20;
         gp.player.gb = ey;
         gp.block_held = true;
@@ -4069,7 +4084,10 @@ mod tests {
             .expect("19456 has a kind-12 enemy");
         let (ex, ey) = (gp.enemy_states[idx].x, gp.enemy_states[idx].y);
         gp.enemy_states[idx].dx = 0;
-        gp.enemy_states[idx].action = 0;
+        {
+            let anim_set = gp.enemy_states[idx].anim_set.clone().unwrap();
+            gp.enemy_states[idx].set_action(&anim_set, 0);
+        }
         gp.player.ga = ex - 20;
         gp.player.gb = ey;
         gp.block_held = true;
@@ -4123,7 +4141,10 @@ mod tests {
             .expect("19456 has a kind-12 enemy");
         let (ex, ey) = (gp.enemy_states[idx].x, gp.enemy_states[idx].y);
         gp.enemy_states[idx].dx = 0;
-        gp.enemy_states[idx].action = 0;
+        {
+            let anim_set = gp.enemy_states[idx].anim_set.clone().unwrap();
+            gp.enemy_states[idx].set_action(&anim_set, 0);
+        }
         gp.player.ga = ex - 20;
         gp.player.gb = ey;
         gp.block_held = true;

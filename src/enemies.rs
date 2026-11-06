@@ -57,6 +57,19 @@ pub struct Enemy {
     /// m(10) * 1000 ms): the countdown between the
     /// enemy's death and its respawn.
     pub et: i32,
+    /// Main special enemy `dM` (dS, e.java:2827):
+    /// a kind-13 enemy whose extra[9] (`bl3`) is
+    /// set — or whose extra[10] is set (that one
+    /// is both `dM` and `dN`). Its health (`ek`
+    /// and `en`) is quadrupled at load, and it
+    /// deals half damage (see the attack branch).
+    pub is_dm: bool,
+    /// Second special enemy `dN` (dS, e.java:2834):
+    /// a kind-13 enemy whose extra[10] (`bl2`) is
+    /// set — it is also `dM`. The special-attack
+    /// trigger never fires for it (`dN != n9`,
+    /// e.java:6303).
+    pub is_dn: bool,
 }
 
 pub fn enemies(parsed: &LevelEntities) -> Vec<Enemy> {
@@ -94,13 +107,28 @@ pub fn enemies(parsed: &LevelEntities) -> Vec<Enemy> {
                     }
                 }
             };
+            // dM/dN (dS, e.java:2827-2835): kind 13
+            // extra[9] (`bl3`) marks the main enemy
+            // `dM`; extra[10] (`bl2`) marks `dN` and
+            // also `dM`. Either one quadruples the
+            // enemy's health (`ek <<= 2; en = ek`)
+            // at load — these are the elite/boss
+            // enemies (e.g. 9217's kind-13 at
+            // (1408,560) has 25 -> 100).
+            let is_dm = group.kind == 13 && (e[9] == 1 || e[10] == 1);
+            let is_dn = group.kind == 13 && e[10] == 1;
+            let health = if is_dm {
+                (e[3] as i32) << 2
+            } else {
+                e[3] as i32
+            };
             out.push(Enemy {
                 index: out.len(),
                 kind: group.kind,
                 x,
                 y,
                 facing_right: e[7] != 1,
-                health: e[3] as i32,
+                health,
                 ev,
                 el: e[5] as i32,
                 em: e[4] as i32,
@@ -111,6 +139,8 @@ pub fn enemies(parsed: &LevelEntities) -> Vec<Enemy> {
                 dy: e[6] as i32,
                 ec: e[0] as i32,
                 et: e[1] as i32 * 1000,
+                is_dm,
+                is_dn,
             });
         }
     }
@@ -193,7 +223,12 @@ mod tests {
         assert_eq!(list[8].kind, 13);
         assert_eq!(list[8].anim_id, 13312);
         assert_eq!(list[8].sprite_id, 13313);
-        assert_eq!(list[8].health, 25);
+        // dM (dS, e.java:2827-2831): extra[9] set,
+        // so health is quadrupled (25 -> 100) and
+        // it is the main enemy, not the dN one.
+        assert!(list[8].is_dm, "9217 kind-13 is dM");
+        assert!(!list[8].is_dn, "9217 kind-13 is not dN");
+        assert_eq!(list[8].health, 100);
     }
     #[test]
     fn enemy_chase_moves_toward_player() {
@@ -519,6 +554,349 @@ mod tests {
         let ef = super::enemy_bbox_height(&anim, &sprites, 0);
         assert!(ef > 16 && ef < 128, "ef = {ef}");
     }
+
+    // ---- dS (enemy special attacks) ----
+
+    fn anim_18432() -> crate::anim::AnimSet {
+        let data = std::fs::read("../extracted/RP18").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        crate::anim::load_anim_set(&pack.chunk(0).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn ds_transitions_by_action_and_kind() {
+        // e.java:4314 (`i()`): `dS` is maintained
+        // from the kind class and the new action.
+        let anim = anim_18432();
+        let data = std::fs::read("../extracted/RP9").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        let chunk = pack.chunk(1).unwrap();
+        let parsed = crate::entities::parse_level_entities(9217, &chunk).unwrap();
+        let list = super::enemies(&parsed);
+        // Kind 11 (x=336).
+        let mut st = super::EnemyState::new(
+            list.iter().find(|e| e.x == 336).unwrap().clone(),
+            &anim,
+        );
+        assert_eq!(st.ds, -1);
+        st.set_action(&anim, 5);
+        assert_eq!(st.ds, 0);
+        st.set_action(&anim, 6);
+        assert_eq!(st.ds, 0);
+        st.dx = 100;
+        st.set_action(&anim, 8);
+        assert_eq!(st.ds, 1);
+        assert_eq!(st.dx, 0, "dS 1 resets dX");
+        st.set_action(&anim, 2);
+        assert_eq!(st.ds, 2);
+        st.set_action(&anim, 11);
+        assert_eq!(st.ds, 3);
+        st.set_action(&anim, 3);
+        assert_eq!(st.ds, 3);
+        st.set_action(&anim, 0);
+        assert_eq!(st.ds, -1);
+        // Kind 13 (the 9217 dM at x=1408).
+        let mut st13 = super::EnemyState::new(
+            list.iter().find(|e| e.kind == 13).unwrap().clone(),
+            &anim,
+        );
+        st13.set_action(&anim, 7);
+        assert_eq!(st13.ds, 1);
+        st13.set_action(&anim, 13);
+        assert_eq!(st13.ds, 1);
+        st13.set_action(&anim, 17);
+        assert_eq!(st13.ds, 1);
+        st13.set_action(&anim, 5);
+        assert_eq!(st13.ds, -1);
+        // Kind 12 (19456, first kind-12 enemy).
+        let data = std::fs::read("../extracted/RP19").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        let chunk = pack.chunk(0).unwrap();
+        let parsed = crate::entities::parse_level_entities(19456, &chunk).unwrap();
+        let list = super::enemies(&parsed);
+        let mut st12 = super::EnemyState::new(
+            list.iter().find(|e| e.kind == 12).unwrap().clone(),
+            &anim,
+        );
+        st12.set_action(&anim, 7);
+        assert_eq!(st12.ds, 1);
+        st12.set_action(&anim, 12);
+        assert_eq!(st12.ds, 1);
+        st12.set_action(&anim, 5);
+        assert_eq!(st12.ds, -1);
+    }
+
+    #[test]
+    fn ei_eh_flags() {
+        // e.java:4314: `ei` (kind 11 in 13/17/23/
+        // 12/15/16/14/21) and `eh` (kind 11 in
+        // 19/18/26/20) are pure functions of the
+        // kind and the current action.
+        let anim = anim_18432();
+        let data = std::fs::read("../extracted/RP9").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        let chunk = pack.chunk(1).unwrap();
+        let parsed = crate::entities::parse_level_entities(9217, &chunk).unwrap();
+        let list = super::enemies(&parsed);
+        let mut st = super::EnemyState::new(
+            list.iter().find(|e| e.x == 336).unwrap().clone(),
+            &anim,
+        );
+        for a in [13, 17, 23, 12, 15, 16, 14, 21] {
+            st.set_action(&anim, a);
+            assert!(st.is_ei(), "action {a} is ei");
+            assert!(!st.is_eh(), "action {a} is not eh");
+        }
+        for a in [19, 18, 26, 20] {
+            st.set_action(&anim, a);
+            assert!(st.is_eh(), "action {a} is eh");
+            assert!(!st.is_ei(), "action {a} is not ei");
+        }
+        st.set_action(&anim, 5);
+        assert!(!st.is_ei() && !st.is_eh(), "action 5 is neither");
+        // Only kind 11 has ei/eh.
+        let mut st13 = super::EnemyState::new(
+            list.iter().find(|e| e.kind == 13).unwrap().clone(),
+            &anim,
+        );
+        st13.set_action(&anim, 13);
+        assert!(!st13.is_ei() && !st13.is_eh(), "kind 13 has no ei/eh");
+    }
+
+    #[test]
+    fn ds_freeze_guard_during_grapple() {
+        // e.java:4354: while a grapple is in
+        // progress (and this is not the grappled
+        // enemy), a non-`eh` enemy may not start
+        // a new action other than 7 or 11 — an
+        // idle enemy stays idle, a moving one is
+        // forced to idle, and only the spawn-in
+        // action is allowed through.
+        let anim = anim_18432();
+        let data = std::fs::read("../extracted/RP9").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        let chunk = pack.chunk(1).unwrap();
+        let parsed = crate::entities::parse_level_entities(9217, &chunk).unwrap();
+        let list = super::enemies(&parsed);
+        let mut st = super::EnemyState::new(
+            list.iter().find(|e| e.x == 336).unwrap().clone(),
+            &anim,
+        );
+        st.frozen = true;
+        // Idle enemy: a new action is refused.
+        st.set_action(&anim, 5);
+        assert_eq!(st.action, 0, "frozen idle enemy stays idle");
+        // Spawn-in is allowed through.
+        st.set_action(&anim, 27);
+        assert_eq!(st.action, 27, "frozen spawn-in is allowed");
+        // A moving enemy is forced to idle.
+        st.frozen = false;
+        st.set_action(&anim, 1);
+        assert_eq!(st.action, 1);
+        st.frozen = true;
+        st.set_action(&anim, 5);
+        assert_eq!(st.action, 0, "frozen moving enemy is forced to idle");
+        // Actions 7 and 11 are exempt.
+        st.set_action(&anim, 11);
+        assert_eq!(st.action, 11, "frozen action 11 is exempt");
+        st.set_action(&anim, 7);
+        assert_eq!(st.action, 7, "frozen action 7 is exempt");
+    }
+
+    #[test]
+    fn dm_dn_flags_and_health() {
+        // e.java:2827-2835: kind-13 extra[9] marks
+        // `dM`, extra[10] marks `dN` (and also
+        // `dM`); either quadruples the health.
+        let data = std::fs::read("../extracted/RP9").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        let chunk = pack.chunk(1).unwrap();
+        let parsed = crate::entities::parse_level_entities(9217, &chunk).unwrap();
+        let list = super::enemies(&parsed);
+        let dm = list.iter().find(|e| e.kind == 13).unwrap();
+        assert!(dm.is_dm && !dm.is_dn, "9217 kind-13 is dM, not dN");
+        assert_eq!(dm.health, 100, "25 << 2");
+        // 27648 has the only dN enemy.
+        let data = std::fs::read("../extracted/RP27").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        let chunk = pack.chunk(0).unwrap();
+        let parsed = crate::entities::parse_level_entities(27648, &chunk).unwrap();
+        let list = super::enemies(&parsed);
+        let dn = list
+            .iter()
+            .find(|e| e.kind == 13 && e.anim_id == 14336)
+            .expect("27648 has a dN enemy");
+        assert!(dn.is_dm && dn.is_dn, "dN is also dM");
+        assert_eq!(dn.health, 8000, "2000 << 2");
+    }
+
+    #[test]
+    fn special_attack_trigger_fires_when_airborne() {
+        // e.java:6303: an airborne enemy (the tile
+        // at its feet is not solid), not `ei`/`eh`,
+        // with `dS != 1`, in an allowed action,
+        // that is not `dN`, starts its special
+        // attack (11 kind 11).
+        let anim = anim_18432();
+        let data = std::fs::read("../extracted/RP9").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        let chunk = pack.chunk(1).unwrap();
+        let parsed = crate::entities::parse_level_entities(9217, &chunk).unwrap();
+        let flags = flags_9217(&parsed);
+        let list = super::enemies(&parsed);
+        let mut rng = crate::pickups::OrbRng(1);
+        let mut st = super::EnemyState::new(
+            list.iter().find(|e| e.x == 336).unwrap().clone(),
+            &anim,
+        );
+        // Lift it into the air (y=400, row 25 is
+        // empty at tile 21) and idle it; the
+        // player is far away so no normal attack
+        // or chase fires.
+        st.y = 400;
+        assert!(!flags.solid(st.x / 16, st.y / 16), "test setup is airborne");
+        st.set_action(&anim, 0);
+        st.tick(&anim, &flags, 0, 0, &mut rng);
+        assert_eq!(st.action, 11, "airborne enemy starts the special attack");
+        assert_eq!(st.ds, 3, "action 11 sets dS 3");
+    }
+
+    #[test]
+    fn special_attack_does_not_fire_when_grounded() {
+        // The same enemy on the ground (y=560,
+        // tile (21,35) solid) must not start its
+        // special attack.
+        let anim = anim_18432();
+        let data = std::fs::read("../extracted/RP9").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        let chunk = pack.chunk(1).unwrap();
+        let parsed = crate::entities::parse_level_entities(9217, &chunk).unwrap();
+        let flags = flags_9217(&parsed);
+        let list = super::enemies(&parsed);
+        let mut rng = crate::pickups::OrbRng(1);
+        let mut st = super::EnemyState::new(
+            list.iter().find(|e| e.x == 336).unwrap().clone(),
+            &anim,
+        );
+        assert!(flags.solid(st.x / 16, st.y / 16), "test setup is grounded");
+        st.set_action(&anim, 0);
+        st.tick(&anim, &flags, 0, 0, &mut rng);
+        assert_ne!(st.action, 11, "grounded enemy does not start the special attack");
+    }
+
+    #[test]
+    fn special_attack_dives_and_lands() {
+        // e.java:5867-5880 + 7044-7072: the special
+        // attack dives (the anim's own dy plus the
+        // accelerating `dJ`) and ends on landing
+        // with the landing stagger (7 kind 11).
+        let anim = anim_18432();
+        let data = std::fs::read("../extracted/RP9").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        let chunk = pack.chunk(1).unwrap();
+        let parsed = crate::entities::parse_level_entities(9217, &chunk).unwrap();
+        let flags = flags_9217(&parsed);
+        let list = super::enemies(&parsed);
+        let mut rng = crate::pickups::OrbRng(1);
+        let mut st = super::EnemyState::new(
+            list.iter().find(|e| e.x == 336).unwrap().clone(),
+            &anim,
+        );
+        st.y = 400;
+        st.set_action(&anim, 11);
+        let y0 = st.y;
+        let mut landed = false;
+        for _ in 0..100 {
+            st.tick(&anim, &flags, 0, 0, &mut rng);
+            if st.action == 7 {
+                landed = true;
+                break;
+            }
+        }
+        assert!(landed, "special attack lands (action 7), y={} action={}", st.y, st.action);
+        assert!(st.y > y0, "it dove down from {y0} to {}", st.y);
+        assert_eq!(st.y, 560, "it snaps to the ground tile top (row 35)");
+        assert_eq!(st.ds, 2, "landing stagger 7 sets dS 2");
+    }
+
+    #[test]
+    fn special_attack_deals_contact_damage() {
+        // e.java:6600-6625: the special attack's
+        // hitbox overlap deals el<<1 (a normal
+        // enemy, not `dM`), once.
+        let anim = anim_18432();
+        let data = std::fs::read("../extracted/RP19").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        let chunk = pack.chunk(0).unwrap();
+        let parsed = crate::entities::parse_level_entities(19456, &chunk).unwrap();
+        let flags = crate::player::TileFlags::build(
+            &parsed,
+            &crate::entities::load_footprints(
+                &mut crate::resources::Resources::new("../extracted"),
+                &parsed,
+            )
+            .unwrap(),
+        );
+        let list = super::enemies(&parsed);
+        let mut rng = crate::pickups::OrbRng(1);
+        let mut st = super::EnemyState::new(
+            list.iter().find(|e| e.kind == 12).unwrap().clone(),
+            &anim,
+        );
+        assert!(!st.enemy.is_dm, "kind-12 test enemy is not dM");
+        // Airborne (lift it above its spawn) and
+        // in the special attack; the player stands
+        // 20 px to the right, inside the 32 px
+        // contact range.
+        st.y -= 64;
+        st.set_action(&anim, 8);
+        let el = st.el;
+        let dmg = st.tick(&anim, &flags, st.x + 20, st.y, &mut rng);
+        assert_eq!(dmg, el << 1, "special attack deals el<<1, got {dmg} (el={el})");
+        // Only once.
+        let dmg2 = st.tick(&anim, &flags, st.x + 20, st.y, &mut rng);
+        assert_eq!(dmg2, 0, "contact damage lands once");
+    }
+
+    #[test]
+    fn dm_deals_half_damage() {
+        // e.java:6600-6609: the `dM != n9`
+        // doubling does not apply to a `dM`
+        // enemy — it deals el (action 5) / el<<1
+        // (action 6) instead of el<<1 / el<<2.
+        let anim = anim_18432();
+        let data = std::fs::read("../extracted/RP9").unwrap();
+        let pack = crate::rp::parse_pack(&data).unwrap();
+        let chunk = pack.chunk(1).unwrap();
+        let parsed = crate::entities::parse_level_entities(9217, &chunk).unwrap();
+        let flags = flags_9217(&parsed);
+        let list = super::enemies(&parsed);
+        let mut rng = crate::pickups::OrbRng(1);
+        let mut st = super::EnemyState::new(
+            list.iter().find(|e| e.kind == 13).unwrap().clone(),
+            &anim,
+        );
+        assert!(st.enemy.is_dm, "9217 kind-13 is dM");
+        let el = st.el;
+        // Action 5: hit at frame >= 2.
+        st.set_action(&anim, 5);
+        let mut dmg = 0;
+        for _ in 0..5 {
+            dmg = dmg.max(st.tick(&anim, &flags, st.x + 20, st.y, &mut rng));
+        }
+        assert_eq!(dmg, el, "dM action 5 deals el, got {dmg} (el={el})");
+        // Action 6: el<<1.
+        let mut st = super::EnemyState::new(
+            list.iter().find(|e| e.kind == 13).unwrap().clone(),
+            &anim,
+        );
+        st.set_action(&anim, 6);
+        let mut dmg = 0;
+        for _ in 0..5 {
+            dmg = dmg.max(st.tick(&anim, &flags, st.x + 20, st.y, &mut rng));
+        }
+        assert_eq!(dmg, el << 1, "dM action 6 deals el<<1, got {dmg} (el={el})");
+    }
 }
 
 /// A live enemy (slice 3d-2): position, facing and animation slot.
@@ -604,6 +982,37 @@ pub struct EnemyState {
     /// on its own repeat end or the timer,
     /// whichever comes first.
     pub spawn_in: i32,
+    /// Special-attack state `dS` (dS, e.java:4314):
+    /// maintained by `set_action` from the kind
+    /// class and the new action — kind 11: 5/6/16/15
+    /// -> 0, 8/9/10/24 -> 1 (and `dx` = 0), 2/7 ->
+    /// 2, 11/21/3 -> 3, else -1; kind 12: 7/12/13
+    /// -> 1 (and `dx` = 0), else -1; kind 13:
+    /// 7/13/17/16 -> 1 (and `dx` = 0), else -1.
+    /// The special-attack trigger (e.java:6303)
+    /// needs `dS != 1`. Starts -1 (idle).
+    pub ds: i32,
+    /// Dive velocity `dJ` (dS, e.java:5867-5878):
+    /// the special attack's extra downward speed,
+    /// 0 -> 4 -> 8 (+4 per 200 ms). Reset to 0
+    /// whenever the enemy is not in its special
+    /// attack.
+    pub dj: i32,
+    /// Dive timer `dK` (dS, e.java:5869-5872):
+    /// ms since the last `dJ` step; reset with
+    /// `dj` when the special attack is not active.
+    pub dk: i32,
+    /// Freeze guard (dS, e.java:4354): set by
+    /// Gameplay's enemy loop while a grapple is
+    /// in progress and this is not the grappled
+    /// enemy — `set_action` then forces new
+    /// actions to idle (0), except the spawn-in
+    /// actions (27/14/18) and actions 7/11.
+    /// (The `ay > 0` half of the original's
+    /// guard is a camera pan that never occurs
+    /// in the decompiled code — `ay` is only
+    /// ever assigned -1 — so it is not ported.)
+    pub frozen: bool,
     /// The enemy's anim set (cloned at load, Phase 4):
     /// lets the cutscene set the enemy's action to
     /// an aZ-table entry without a Resources lookup.
@@ -634,9 +1043,114 @@ impl EnemyState {
             ed: enemy.ec,
             er: enemy.et,
             spawn_in: 0,
+            ds: -1,
+            dj: 0,
+            dk: 0,
+            frozen: false,
             anim_set: None,
             enemy,
         }
+    }
+
+    /// `ei` (dS, e.java:4314): a kind-11 enemy in
+    /// one of the elite attack actions (13, 17, 23,
+    /// 12, 15, 16, 14, 21). A pure function of the
+    /// kind and the current action — it is set by
+    /// `i()` on every action change, and the
+    /// special-attack trigger (e.java:6303) and the
+    /// AI both gate on it.
+    pub fn is_ei(&self) -> bool {
+        self.enemy.kind == 11 && matches!(self.action, 13 | 17 | 23 | 12 | 15 | 16 | 14 | 21)
+    }
+
+    /// `eh` (dS, e.java:4314): a kind-11 enemy in
+    /// one of the elite hurt/spawn actions (19, 18,
+    /// 26, 20). Like `ei`, a pure function of the
+    /// kind and the current action; the trigger and
+    /// the freeze guard both gate on it.
+    pub fn is_eh(&self) -> bool {
+        self.enemy.kind == 11 && matches!(self.action, 19 | 18 | 26 | 20)
+    }
+
+    /// The enemy action setter `i(int, int)`
+    /// (e.java:4314-4410), ported whole: it
+    /// maintains `dS` (and resets `dx` to 0 when
+    /// `dS` becomes 1), then applies the freeze
+    /// guard when `frozen` is set (a grapple is
+    /// in progress and this is not the grappled
+    /// enemy): a non-`eh` enemy may not start a
+    /// new action other than 7 or 11 — an idle
+    /// enemy stays idle, a moving one is forced
+    /// to idle, and only the spawn-in action
+    /// (27 kind 11, 14 kind 12, 18 kind 13) is
+    /// allowed through. `dS` is updated from the
+    /// REQUESTED action before the guard runs,
+    /// as in the original (so a rejected request
+    /// still leaves its `dS` behind).
+    /// The `eu` re-randomisation on action 1 is
+    /// NOT done here: the port's chase branch
+    /// already re-randomises `eu` when the enemy
+    /// starts walking, which is the same moment
+    /// (`i(1, ...)` is only ever called on the
+    /// idle-to-walk transition).
+    pub fn set_action(&mut self, anim_set: &anim::AnimSet, action: usize) {
+        match self.enemy.kind {
+            11 => match action {
+                5 | 6 | 16 | 15 => self.ds = 0,
+                8 | 9 | 10 | 24 => {
+                    self.dx = 0;
+                    self.ds = 1;
+                }
+                2 | 7 => self.ds = 2,
+                11 | 21 | 3 => self.ds = 3,
+                _ => self.ds = -1,
+            },
+            12 => {
+                if matches!(action, 7 | 12 | 13) {
+                    self.dx = 0;
+                    self.ds = 1;
+                } else {
+                    self.ds = -1;
+                }
+            }
+            13 => {
+                if matches!(action, 7 | 13 | 17 | 16) {
+                    self.dx = 0;
+                    self.ds = 1;
+                } else {
+                    self.ds = -1;
+                }
+            }
+            _ => self.ds = -1,
+        }
+        let new_eh = self.enemy.kind == 11 && matches!(action, 19 | 18 | 26 | 20);
+        if self.frozen && !new_eh && action != 7 && action != 11 {
+            let current = self.action;
+            let spawn_in = match self.enemy.kind {
+                12 => 14,
+                13 => 18,
+                _ => 27,
+            };
+            let idle_now = match self.enemy.kind {
+                12 => matches!(current, 0 | 12 | 10),
+                13 => matches!(current, 0 | 12 | 11),
+                _ => current == 0,
+            };
+            if idle_now && action != spawn_in {
+                // Idle enemy: no change.
+                return;
+            }
+            if action == spawn_in {
+                // Spawn-in is allowed through.
+            } else {
+                // Moving/acting enemy: forced to idle.
+                self.action = 0;
+                self.slot = anim::AnimSlot::new(anim_set, 0);
+                return;
+            }
+        }
+        self.action = action;
+        self.slot = anim::AnimSlot::new(anim_set, action);
     }
 
     /// Spawn-in action by kind class (Phase 8,
@@ -748,12 +1262,12 @@ impl EnemyState {
         self.health -= amount;
         if self.health <= 0 {
             self.dying = true;
-            self.action = self.death_action();
-            self.slot = anim::AnimSlot::new(anim_set, self.action);
+            let death = self.death_action();
+            self.set_action(anim_set, death);
             return true;
         }
-        self.action = self.stagger_action(heavy, current_action);
-        self.slot = anim::AnimSlot::new(anim_set, self.action);
+        let stagger = self.stagger_action(heavy, current_action);
+        self.set_action(anim_set, stagger);
         false
     }
 
@@ -809,11 +1323,69 @@ impl EnemyState {
             self.spawn_in -= 1;
             if self.spawn_in <= 0 || self.slot.repeat == 0 {
                 self.spawn_in = 0;
-                self.action = 0;
-                self.slot = anim::AnimSlot::new(anim_set, 0);
+                self.set_action(anim_set, 0);
             }
             return 0;
         }
+        // Special attack (dS): kind 11 action 11,
+        // kind 12 action 8, kind 13 action 10.
+        // The enemy dives — the anim's own dy root
+        // motion (action 11 totals +1371 over its
+        // 63 loops) plus the accelerating `dJ`
+        // (0 -> 4 -> 8, +4 per 200 ms) — and deals
+        // contact damage once (el<<1, or el for a
+        // `dM` enemy). It ends on landing (the tile
+        // at the feet is solid, e.java:7044-7072:
+        // the landing stagger 7 kind 11, 9 kind 12,
+        // 8 kind 13) or when its anim ends, and
+        // the enemy idles. This branch runs before
+        // the stagger branch: kind 12's action 8
+        // is a special attack here, not a stagger.
+        if matches!((self.enemy.kind, self.action), (11, 11) | (12, 8) | (13, 10)) {
+            let (dx, dy) = self.slot.advance(anim_set, 40);
+            self.x += if self.facing_right { dx } else { -dx };
+            self.dk += 40;
+            if self.dk > 200 {
+                self.dk -= 200;
+                if self.dj < 8 {
+                    self.dj += 4;
+                }
+            }
+            self.y += dy + self.dj;
+            let mut damage = 0;
+            if !self.attack_hit_done
+                && (player_x - self.x).abs() < 32
+                && (player_y - self.y).abs() < 16
+            {
+                self.attack_hit_done = true;
+                damage = if self.enemy.is_dm {
+                    self.el
+                } else {
+                    self.el << 1
+                };
+            }
+            let foot_row = self.y / 16;
+            if flags.solid(self.x / 16, foot_row) {
+                self.y = foot_row * 16;
+                let land = match self.enemy.kind {
+                    12 => 9,
+                    13 => 8,
+                    _ => 7,
+                };
+                self.set_action(anim_set, land);
+                self.dj = 0;
+                self.dk = 0;
+            } else if self.slot.repeat == 0 {
+                self.set_action(anim_set, 0);
+                self.dj = 0;
+                self.dk = 0;
+            }
+            return damage;
+        }
+        // Not in a special attack: `dJ`/`dK` reset
+        // (e.java:5877-5878).
+        self.dj = 0;
+        self.dk = 0;
         // Stagger in progress (actions 2/4, and the
         // heavy variants 7/8/9 from apply_damage in
         // this port): play it with its root-motion
@@ -824,8 +1396,7 @@ impl EnemyState {
             let (dx, _dy) = self.slot.advance(anim_set, 40);
             self.x += if self.facing_right { dx } else { -dx };
             if self.slot.repeat == 0 {
-                self.action = 0;
-                self.slot = anim::AnimSlot::new(anim_set, 0);
+                self.set_action(anim_set, 0);
             }
             return 0;
         }
@@ -836,17 +1407,27 @@ impl EnemyState {
             let mut damage = 0;
             if self.slot.frame >= 2 && !self.attack_hit_done {
                 self.attack_hit_done = true;
-                // el<<1 for action 5, el<<2 for action 6 (normal
-                // enemy, not dM): see the damage formula in e.java.
-                damage = if self.action == 6 {
+                // el<<1 for action 5, el<<2 for
+                // action 6 (a normal enemy, not
+                // `dM`): e.java:6600-6609 — the
+                // `dM != n9` doubling does not
+                // apply to a `dM` enemy, so it
+                // deals el (action 5) / el<<1
+                // (action 6).
+                damage = if self.enemy.is_dm {
+                    if self.action == 6 {
+                        self.el << 1
+                    } else {
+                        self.el
+                    }
+                } else if self.action == 6 {
                     self.el << 2
                 } else {
                     self.el << 1
                 };
             }
             if self.slot.repeat == 0 {
-                self.action = 0;
-                self.slot = anim::AnimSlot::new(anim_set, 0);
+                self.set_action(anim_set, 0);
             }
             return damage;
         }
@@ -854,12 +1435,64 @@ impl EnemyState {
         let dy_player = player_y - self.y;
         let near_attack = dx_player.abs() < 48 && dy_player.abs() < 16;
         let near_chase = dx_player.abs() < 144 && dy_player.abs() < 32;
+        // Special-attack trigger (e.java:6303):
+        // an airborne (`!eA`) enemy — the tile at
+        // its feet is not solid (flag 1,
+        // e.java:5850) — not `ei`/`eh`, with
+        // `dS != 1`, in an allowed action, that
+        // is not the `dN` special enemy, starts
+        // its special attack (11 kind 11, 8 kind
+        // 12, 10 kind 13). In the port an enemy
+        // that walked off a ledge floats (no
+        // enemy gravity), so it reads airborne
+        // until the dive brings it back to the
+        // ground. The kind-1 exclusion list in
+        // the original repeats 11 twice; the set
+        // used here is {11, 27, 3, 24}.
+        let grounded = flags.solid(self.x / 16, self.y / 16);
+        let special_ok = match self.enemy.kind {
+            11 => !matches!(self.action, 11 | 27 | 3 | 24),
+            12 => !matches!(self.action, 8 | 14),
+            13 => !matches!(self.action, 10 | 18),
+            _ => false,
+        };
+        if !grounded
+            && !self.is_ei()
+            && !self.is_eh()
+            && self.ds != 1
+            && special_ok
+            && !self.enemy.is_dn
+        {
+            let special = match self.enemy.kind {
+                12 => 8,
+                13 => 10,
+                _ => 11,
+            };
+            self.set_action(anim_set, special);
+            self.attack_hit_done = false;
+            return 0;
+        }
+        // Frozen (a grapple is in progress and
+        // this is not the grappled enemy): the
+        // enemy goes idle and stays idle while
+        // the grapple runs (the `i()` guard,
+        // e.java:4354). The state-playback
+        // branches above (dying, spawn-in,
+        // stagger, attack, special) still run;
+        // only new AI decisions are suppressed.
+        if self.frozen {
+            if self.action != 0 {
+                self.set_action(anim_set, 0);
+            }
+            self.slot.advance(anim_set, 40);
+            return 0;
+        }
         // Attack trigger (type-1 AI: |N&3|==3 -> action 6, else 5;
         // approximated here as every 4th attack being action 6).
         if near_attack {
             self.attack_count += 1;
-            self.action = if self.attack_count % 4 == 0 { 6 } else { 5 };
-            self.slot = anim::AnimSlot::new(anim_set, self.action);
+            let attack = if self.attack_count % 4 == 0 { 6 } else { 5 };
+            self.set_action(anim_set, attack);
             self.attack_hit_done = false;
             if dx_player > 0 {
                 self.facing_right = true;
@@ -885,8 +1518,7 @@ impl EnemyState {
             } else {
                 self.eu -= 40;
                 if self.action != 0 {
-                    self.action = 0;
-                    self.slot = anim::AnimSlot::new(anim_set, 0);
+                    self.set_action(anim_set, 0);
                 }
                 self.slot.advance(anim_set, 40);
                 return 0;
@@ -908,15 +1540,13 @@ impl EnemyState {
         };
         if !walk {
             if self.action != 0 {
-                self.action = 0;
-                self.slot = anim::AnimSlot::new(anim_set, 0);
+                self.set_action(anim_set, 0);
             }
             self.slot.advance(anim_set, 40);
             return 0;
         }
         if self.action != 1 {
-            self.action = 1;
-            self.slot = anim::AnimSlot::new(anim_set, 1);
+            self.set_action(anim_set, 1);
         }
         let (dx, _dy) = self.slot.advance(anim_set, 40);
         let step = dx.abs();
